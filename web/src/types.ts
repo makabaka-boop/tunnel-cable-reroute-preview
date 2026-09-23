@@ -77,7 +77,58 @@ export interface CalibrationPayload {
   max_rms_error: number;
 }
 
-export interface PrecheckResponse {
+// ---------- 一次性改线预览 ----------
+
+export interface ReroutePayload {
+  start_index: number;
+  end_index: number;
+  replacement_points: Point[];
+}
+
+export interface RiskEvent {
+  segment_index: number;
+  circle_index: number;
+  nearest: Point;
+  distance: number;
+  expanded_radius: number;
+  mileage: number;
+}
+
+export interface PersistedRisk {
+  segment_index: number;
+  circle_index: number;
+  nearest: Point;
+  distance: number;
+  expanded_radius: number;
+  original_mileage: number;
+  candidate_mileage: number;
+}
+
+export interface CircleRisk {
+  circle_index: number;
+  eliminated: RiskEvent[];
+  added: RiskEvent[];
+  remaining: PersistedRisk[];
+}
+
+export interface CandidateRoute extends PrecheckResponseBase {
+  // 候选线不携带 calibration/reroute_preview（二者是整次请求级字段）
+}
+
+export interface ReroutePreview {
+  range: {
+    start_index: number;
+    end_index: number;
+    replacement_point_count: number;
+  };
+  candidate: CandidateRoute;
+  circle_risks: CircleRisk[];
+  eliminated_count: number;
+  added_count: number;
+  remaining_count: number;
+}
+
+interface PrecheckResponseBase {
   feasible: boolean;
   cable_radius: number;
   nodes: Point[];
@@ -87,8 +138,13 @@ export interface PrecheckResponse {
   collisions: Collision[];
   intrusion_intervals: IntrusionInterval[];
   compound_intrusion_segments: CompoundIntrusionSegment[];
+}
+
+export interface PrecheckResponse extends PrecheckResponseBase {
   // 请求带 calibration 时给出标定摘要；省略时为 null/缺省（逐项兼容）
   calibration?: CalibrationResult | null;
+  // 请求带 reroute 时给出一次性改线预览（原线结论仍在顶层）
+  reroute_preview?: ReroutePreview | null;
 }
 
 export interface PrecheckPayload {
@@ -96,6 +152,7 @@ export interface PrecheckPayload {
   cable_radius: number;
   circles: Array<Point & { radius: number }>;
   calibration?: CalibrationPayload;
+  reroute?: ReroutePayload;
 }
 
 export type FieldErrors = Record<string, string>;

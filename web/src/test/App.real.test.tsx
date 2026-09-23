@@ -603,4 +603,123 @@ describe("真实请求 + 录入 + 高亮（App）", () => {
     expect(screen.queryByTestId("calibration-panel")).not.toBeInTheDocument();
     vi.unstubAllGlobals();
   });
+
+  // ---------- 一次性改线预览 ----------
+
+  it("改线预览：相切原线绕孔后候选可敷设，同一快照切换原线/候选线与风险摘要", async () => {
+    render(<App />);
+    // 默认：(-100,0)->(100,0)、电缆5、孔(0,15)r10 → (0,0) 相切碰撞，里程100
+    await submit();
+    await waitFor(() =>
+      expect(screen.getByTestId("banner-collision")).toBeInTheDocument(),
+    );
+
+    await userEvent.click(screen.getByTestId("reroute-enabled"));
+    // 首尾端点自动锁定为 (-100,0)/(100,0)，且只读
+    expect(
+      (screen.getByTestId("reroute-point-0-x") as HTMLInputElement).readOnly,
+    ).toBe(true);
+    expect((screen.getByTestId("reroute-point-0-x") as HTMLInputElement).value).toBe(
+      "-100",
+    );
+    // 中间加折点 (0,-30)：新路径距孔（扩张15）足够远
+    await userEvent.click(screen.getByTestId("add-reroute-point"));
+    const mx = screen.getByTestId("reroute-point-1-x");
+    const my = screen.getByTestId("reroute-point-1-y");
+    await userEvent.clear(mx);
+    await userEvent.type(mx, "0");
+    await userEvent.clear(my);
+    await userEvent.type(my, "-30");
+
+    await userEvent.click(screen.getByTestId("reroute-preview"));
+    await waitFor(() => expect(screen.getByTestId("view-switch")).toBeInTheDocument());
+
+    // 候选线：可敷设、无碰撞标记、风险摘要显示“消除 1”
+    await waitFor(() => expect(screen.getByTestId("banner-ok")).toBeInTheDocument());
+    expect(screen.queryByTestId("first-collision-marker")).not.toBeInTheDocument();
+    const title = screen.getByTestId("reroute-diff-title").textContent ?? "";
+    expect(title).toContain("消除 1");
+    expect(title).toContain("新增 0");
+    const risk = screen.getByTestId("risk-eliminated-0-0").textContent ?? "";
+    expect(risk).toContain("线段 #0");
+    expect(risk).toContain("里程 100");
+    // 候选 SVG：3 个节点的下绕折线（原线只有 2 个节点）
+    expect(document.querySelectorAll('.scene [data-testid^="node-"]').length).toBe(3);
+    const midNode = document.querySelector('[data-testid="node-1"]');
+    expect(midNode).toBeInTheDocument();
+
+    // 切回原线：相切碰撞与里程 100 的区间恢复，摘要隐藏
+    await userEvent.click(screen.getByTestId("view-original"));
+    await waitFor(() =>
+      expect(screen.getByTestId("banner-collision")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("first-collision-marker")).toBeInTheDocument();
+    expect(screen.queryByTestId("reroute-diff-panel")).not.toBeInTheDocument();
+
+    // 再切候选线：同一快照直接恢复，无需再请求
+    await userEvent.click(screen.getByTestId("view-candidate"));
+    expect(screen.getByTestId("banner-ok")).toBeInTheDocument();
+    expect(screen.getByTestId("reroute-diff-panel")).toBeInTheDocument();
+
+    // 取消预览：只剩原线
+    await userEvent.click(screen.getByTestId("reroute-cancel"));
+    expect(screen.queryByTestId("view-switch")).not.toBeInTheDocument();
+    expect(screen.getByTestId("banner-collision")).toBeInTheDocument();
+  });
+
+  it("改线引入新风险：候选不可敷设且摘要按圈给出“新增”", async () => {
+    render(<App />);
+    // 原线无碰撞：孔放远处 (40,-40)，原线 y=0 距离 40 > 扩张 15
+    await userEvent.clear(screen.getByTestId("circle-0-x"));
+    await userEvent.type(screen.getByTestId("circle-0-x"), "40");
+    await userEvent.clear(screen.getByTestId("circle-0-y"));
+    await userEvent.type(screen.getByTestId("circle-0-y"), "-40");
+    await submit();
+    await waitFor(() => expect(screen.getByTestId("banner-ok")).toBeInTheDocument());
+
+    // 改线中间折点 (0,-60)：第二段 (0,-60)->(100,0) 穿过扩张圈（垂距≈3.4），
+    // 第一段相离，故恰好新增 1 处风险（候选线段下标 1）。
+    await userEvent.click(screen.getByTestId("reroute-enabled"));
+    await userEvent.click(screen.getByTestId("add-reroute-point"));
+    const mx = screen.getByTestId("reroute-point-1-x");
+    const my = screen.getByTestId("reroute-point-1-y");
+    await userEvent.clear(mx);
+    await userEvent.type(mx, "0");
+    await userEvent.clear(my);
+    await userEvent.type(my, "-60");
+
+    await userEvent.click(screen.getByTestId("reroute-preview"));
+    await waitFor(() => expect(screen.getByTestId("view-switch")).toBeInTheDocument());
+    await waitFor(() =>
+      expect(screen.getByTestId("banner-collision")).toBeInTheDocument(),
+    );
+    const title = screen.getByTestId("reroute-diff-title").textContent ?? "";
+    expect(title).toContain("新增 1");
+    expect(screen.getByTestId("risk-added-0-1")).toBeInTheDocument();
+    expect(screen.queryByTestId("risk-eliminated-0-0")).not.toBeInTheDocument();
+    // 切回原线仍可敷设（原方案未被改线结果覆盖）
+    await userEvent.click(screen.getByTestId("view-original"));
+    expect(screen.getByTestId("banner-ok")).toBeInTheDocument();
+  });
+
+  it("改线区间下标非法：本地拦截不发请求，已保存原方案保留", async () => {
+    render(<App />);
+    await submit();
+    await waitFor(() =>
+      expect(screen.getByTestId("banner-collision")).toBeInTheDocument(),
+    );
+
+    await userEvent.click(screen.getByTestId("reroute-enabled"));
+    await userEvent.clear(screen.getByTestId("reroute-end"));
+    await userEvent.type(screen.getByTestId("reroute-end"), "0"); // start 0 == end 0
+    await userEvent.click(screen.getByTestId("reroute-preview"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("reroute-banner-error")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("err-reroute-range").textContent).toContain("严格小于");
+    // 原方案仍在，且没有进入候选视图
+    expect(screen.getByTestId("banner-collision")).toBeInTheDocument();
+    expect(screen.queryByTestId("view-switch")).not.toBeInTheDocument();
+  });
 });

@@ -59,6 +59,8 @@ def _positive_finite(v):
 
 # 整数毫米坐标；外层 StrictInt 确保 "NaN" 之类字符串不被宽松解析。
 MmInt = Annotated[StrictInt, BeforeValidator(_strict_mm_int)]
+# 严格非负整数下标（拒绝布尔、浮点、字符串；取值范围在端点处校验）。
+StrictIndex = Annotated[StrictInt, BeforeValidator(_strict_mm_int)]
 # 正数半径（可以是小数毫米）；StrictFloat/StrictInt 拒绝字符串。
 PositiveRadius = Annotated[
     StrictFloat | StrictInt, BeforeValidator(_positive_finite)
@@ -165,6 +167,22 @@ class CalibrationIn(BaseModel):
         return points
 
 
+class RerouteIn(BaseModel):
+    """一次性改线预览：替换连续节点区间 ``nodes[start_index..end_index]``。
+
+    ``replacement_points`` 为接入两端的替代折点（含区间两端）：首点必须与
+    ``nodes[start_index]`` 精确重合、末点必须与 ``nodes[end_index]`` 精确
+    重合；跨字段的区间/端点/拼接校验在端点处完成。坐标与主路径同为整数
+    毫米，替代折线内部相邻折点不得重合。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    start_index: StrictIndex
+    end_index: StrictIndex
+    replacement_points: Annotated[List[StrictPointIn], Field(min_length=2)]
+
+
 class PrecheckRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -173,6 +191,8 @@ class PrecheckRequest(BaseModel):
     circles: List[StrictCircleIn]
     # 可选现场标定；省略时行为与旧版完全一致。
     calibration: Optional[CalibrationIn] = None
+    # 可选一次性改线预览；省略时请求/响应与旧版逐项兼容。
+    reroute: Optional[RerouteIn] = None
 
     @field_validator("nodes")
     @classmethod
@@ -271,6 +291,80 @@ class CalibrationOut(BaseModel):
     rms_error: float             # 控制点残差均方根（毫米）
 
 
+class RiskEventOut(BaseModel):
+    """消除/新增风险事件（展示值，三位小数；比较内部为未舍入双精度）。"""
+
+    segment_index: int           # 该结论所属路径自身的线段下标
+    circle_index: int
+    nearest: PointOut            # 判定位置
+    distance: float
+    expanded_radius: float
+    mileage: float               # 判定位置在该路径上的累计里程
+
+
+class PersistedRiskOut(BaseModel):
+    """仍存在的风险：同一条原线段上原线/候选线各自的里程（展示三位）。
+
+    前缀段两里程相等；后缀段里程按新路径长度重新累计，差值即里程平移。
+    """
+
+    segment_index: int           # 原线（= 候选前缀）线段下标
+    circle_index: int
+    nearest: PointOut
+    distance: float
+    expanded_radius: float
+    original_mileage: float
+    candidate_mileage: float
+
+
+class CircleRiskOut(BaseModel):
+    """单个禁入圈的改线风险变化摘要（空列表表示该类无变化）。"""
+
+    circle_index: int
+    eliminated: List[RiskEventOut] = Field(default_factory=list)
+    added: List[RiskEventOut] = Field(default_factory=list)
+    remaining: List[PersistedRiskOut] = Field(default_factory=list)
+
+
+class RerouteRangeOut(BaseModel):
+    """本次预览替换的连续节点区间（回显，供前端区间详情定位）。"""
+
+    start_index: int
+    end_index: int
+    replacement_point_count: int
+
+
+class CandidateRouteOut(BaseModel):
+    """候选改线的完整预检结论（与 /api/precheck 顶层字段同语义）。
+
+    circles 与原线共用同一批（标定后的）禁入圈视图；nodes 为拼接后的
+    候选折线；其余碰撞/区间/复合侵入均由同一套未舍入几何链路计算。
+    """
+
+    feasible: bool
+    cable_radius: float
+    nodes: List[PointOut]
+    circles: List[CircleOut]
+    collision_count: int
+    first_collision: CollisionOut | None = None
+    collisions: List[CollisionOut]
+    intrusion_intervals: List[IntrusionIntervalOut] = Field(default_factory=list)
+    compound_intrusion_segments: List[CompoundIntrusionSegmentOut] = Field(
+        default_factory=list
+    )
+
+
+class ReroutePreviewOut(BaseModel):
+    """一次性改线预览：区间回显、候选线全套结论与按圈归类的风险摘要。"""
+
+    range: RerouteRangeOut
+    candidate: CandidateRouteOut
+    circle_risks: List[CircleRiskOut]
+    eliminated_count: int
+    added_count: int
+    remaining_count: int
+
+
 class PrecheckResponse(BaseModel):
     feasible: bool
     cable_radius: float      # 展示用（三位小数）
@@ -285,3 +379,6 @@ class PrecheckResponse(BaseModel):
     )
     # 请求带 calibration 时给出标定摘要；省略时为 null（旧字段逐项兼容）。
     calibration: Optional[CalibrationOut] = None
+    # 请求带 reroute 时给一次性改线预览（原线结论仍在本对象顶层）；
+    # 省略时为 null，旧接口逐项兼容。
+    reroute_preview: Optional[ReroutePreviewOut] = None

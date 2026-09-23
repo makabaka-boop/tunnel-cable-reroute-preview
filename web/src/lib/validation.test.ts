@@ -1,6 +1,16 @@
 import { describe, expect, it } from "vitest";
 import { buildPayload, validateDraft, type FormDraft } from "./validation";
 
+const disabledReroute = {
+  enabled: false,
+  startIndex: "0",
+  endIndex: "1",
+  points: [
+    { x: "0", y: "0" },
+    { x: "100", y: "0" },
+  ],
+};
+
 const okDraft: FormDraft = {
   cableRadius: "5",
   nodes: [
@@ -14,6 +24,7 @@ const okDraft: FormDraft = {
     { surveyX: "", surveyY: "", pathX: "", pathY: "" },
     { surveyX: "", surveyY: "", pathX: "", pathY: "" },
   ],
+  reroute: disabledReroute,
 };
 
 /** 启用标定的合法草稿：纯平移 survey = path + (1000, 2000)。 */
@@ -92,6 +103,7 @@ describe("录入校验 validateDraft（与后端字段键一致）", () => {
       calibrationEnabled: false,
       maxRmsError: "1",
       calibrationPairs: [],
+      reroute: disabledReroute,
     };
     const errors = validateDraft(d);
     expect(Object.keys(errors).sort()).toEqual(
@@ -184,5 +196,124 @@ describe("现场标定校验（字段键与后端 calibration.* 一致）", () =
       const d: FormDraft = { ...calibratedDraft, maxRmsError: bad };
       expect(validateDraft(d)["calibration.max_rms_error"], `bad=${bad}`).toBeTruthy();
     }
+  });
+});
+
+describe("一次性改线校验（字段键与后端 reroute.* 一致）", () => {
+  const validReroute: FormDraft["reroute"] = {
+    enabled: true,
+    startIndex: "0",
+    endIndex: "1",
+    points: [
+      { x: "0", y: "0" },
+      { x: "50", y: "-30" },
+      { x: "100", y: "0" },
+    ],
+  };
+
+  it("未启用：不校验改线，载荷省略 reroute 键", () => {
+    const bad: FormDraft = {
+      ...okDraft,
+      reroute: { enabled: false, startIndex: "5", endIndex: "0", points: [] },
+    };
+    expect(validateDraft(bad)).toEqual({});
+    expect("reroute" in buildPayload(bad)).toBe(false);
+  });
+
+  it("合法改线：无错误，载荷含 reroute（整数毫米端点）", () => {
+    const d: FormDraft = { ...okDraft, reroute: validReroute };
+    expect(validateDraft(d)).toEqual({});
+    expect(buildPayload(d).reroute).toEqual({
+      start_index: 0,
+      end_index: 1,
+      replacement_points: [
+        { x: 0, y: 0 },
+        { x: 50, y: -30 },
+        { x: 100, y: 0 },
+      ],
+    });
+  });
+
+  it("下标越界 / start>=end / 非整数报错", () => {
+    let d: FormDraft = {
+      ...okDraft,
+      reroute: { ...validReroute, startIndex: "9", endIndex: "10" },
+    };
+    expect(validateDraft(d)["reroute.start_index"]).toContain("内的整数");
+
+    d = { ...okDraft, reroute: { ...validReroute, endIndex: "0" } };
+    expect(validateDraft(d)["reroute.start_index"]).toContain("严格小于");
+
+    d = { ...okDraft, reroute: { ...validReroute, startIndex: "1.5" } };
+    expect(validateDraft(d)["reroute.start_index"]).toBeTruthy();
+  });
+
+  it("接入端点必须与边界节点精确重合（不容差）", () => {
+    const d: FormDraft = {
+      ...okDraft,
+      reroute: {
+        ...validReroute,
+        points: [
+          { x: "0", y: "1" },
+          { x: "50", y: "-30" },
+          { x: "100", y: "0" },
+        ],
+      },
+    };
+    expect(validateDraft(d)["reroute.replacement_points[0].x"]).toContain("精确重合");
+
+    const d2: FormDraft = {
+      ...okDraft,
+      reroute: {
+        ...validReroute,
+        points: [
+          { x: "0", y: "0" },
+          { x: "50", y: "-30" },
+          { x: "100", y: "2" },
+        ],
+      },
+    };
+    expect(
+      validateDraft(d2)["reroute.replacement_points[2].x"],
+    ).toContain("精确重合");
+  });
+
+  it("替代折点内部相邻重合 / 不足两个 / 小数坐标报错", () => {
+    const dup: FormDraft = {
+      ...okDraft,
+      reroute: {
+        ...validReroute,
+        points: [
+          { x: "0", y: "0" },
+          { x: "5", y: "5" },
+          { x: "5", y: "5" },
+          { x: "100", y: "0" },
+        ],
+      },
+    };
+    expect(
+      validateDraft(dup)["reroute.replacement_points[2].x"],
+    ).toContain("重合");
+
+    const one: FormDraft = {
+      ...okDraft,
+      reroute: { ...validReroute, points: [{ x: "0", y: "0" }] },
+    };
+    expect(validateDraft(one)["reroute.replacement_points"]).toContain("至少");
+
+    const frac: FormDraft = {
+      ...okDraft,
+      reroute: {
+        ...validReroute,
+        points: [
+          { x: "0", y: "0" },
+          { x: "50.5", y: "-30" },
+          { x: "100", y: "0" },
+        ],
+      },
+    };
+    expect(
+      validateDraft(frac)["reroute.replacement_points[1].x"],
+    ).toBeTruthy();
   });
 });

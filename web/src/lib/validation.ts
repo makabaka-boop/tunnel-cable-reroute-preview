@@ -1,4 +1,4 @@
-import type { FieldErrors, PrecheckPayload } from "../types";
+import type { FieldErrors, PrecheckPayload, ReroutePayload } from "../types";
 
 /** 表单中的原始字段都以字符串保存，提交时统一解析、校验。 */
 export interface NodeDraft {
@@ -17,6 +17,14 @@ export interface CalibrationPairDraft {
   pathX: string;
   pathY: string;
 }
+/** 一次性改线：替换节点区间 + 接入两端的替代折点（含两端点）。 */
+export interface RerouteDraft {
+  enabled: boolean;
+  startIndex: string;
+  endIndex: string;
+  /** 替代折点；首尾两个固定为被替换区间的边界节点（由 App 同步）。 */
+  points: NodeDraft[];
+}
 export interface FormDraft {
   cableRadius: string;
   nodes: NodeDraft[];
@@ -24,6 +32,7 @@ export interface FormDraft {
   calibrationEnabled: boolean;
   maxRmsError: string;
   calibrationPairs: CalibrationPairDraft[];
+  reroute: RerouteDraft;
 }
 
 function parseFiniteInt(raw: string): number {
@@ -43,6 +52,13 @@ function parsePositiveFinite(raw: string): number {
   const n = Number(t);
   if (!Number.isFinite(n)) throw new Error("必须是有限数值");
   if (n <= 0) throw new Error("必须为正数");
+  return n;
+}
+
+function parseNonNegInt(raw: string): number {
+  const t = raw.trim();
+  const n = parseFiniteInt(t);
+  if (n < 0) throw new Error("不能为负数");
   return n;
 }
 
@@ -67,6 +83,21 @@ export function validateDraft(draft: FormDraft): FieldErrors {
   if (draft.nodes.length < 2) {
     errors.nodes = "路径至少需要两个节点";
   }
+  const parsedNodes: ParsedNode[] = draft.nodes.map((node) => {
+    let x: number | null = null;
+    let y: number | null = null;
+    try {
+      x = parseFiniteInt(node.x);
+    } catch {
+      x = null; // 错误在下方逐字段记录
+    }
+    try {
+      y = parseFiniteInt(node.y);
+    } catch {
+      y = null;
+    }
+    return x === null || y === null ? null : { x, y };
+  });
   draft.nodes.forEach((node, i) => {
     try {
       parseFiniteInt(node.x);
@@ -156,7 +187,86 @@ export function validateDraft(draft: FormDraft): FieldErrors {
     }
   }
 
+  // 可选一次性改线：字段键与后端一致（reroute.*）；未启用时不校验不上送。
+  if (draft.reroute.enabled) {
+    validateRerouteDraft(draft, parsedNodes, errors);
+  }
+
   return errors;
+}
+
+/** 已解析的路径节点（主校验通过时可用）；解析失败给 null。 */
+type ParsedNode = { x: number; y: number } | null;
+
+function validateRerouteDraft(
+  draft: FormDraft,
+  parsedNodes: ParsedNode[],
+  errors: FieldErrors,
+): void {
+  const rr = draft.reroute;
+  const nodeCount = draft.nodes.length;
+
+  let start = -1;
+  let end = -1;
+  try {
+    start = parseNonNegInt(rr.startIndex);
+    if (start >= nodeCount) throw new Error("");
+  } catch {
+    errors["reroute.start_index"] = `起点下标必须是 [0, ${nodeCount - 1}] 内的整数`;
+  }
+  try {
+    end = parseNonNegInt(rr.endIndex);
+    if (end >= nodeCount) throw new Error("");
+  } catch {
+    errors["reroute.end_index"] = `终点下标必须是 [0, ${nodeCount - 1}] 内的整数`;
+  }
+  if (start >= 0 && end >= 0 && start >= end) {
+    errors["reroute.start_index"] = "起点下标必须严格小于终点下标（至少替换一条线段）";
+  }
+
+  // 替代折点（整数毫米，至少 2 个，内部不允许相邻重合）
+  const pts: ParsedNode[] = rr.points.map((p, i) => {
+    let x: number | null = null;
+    let y: number | null = null;
+    try {
+      x = parseFiniteInt(p.x);
+    } catch (e) {
+      errors[`reroute.replacement_points[${i}].x`] = `X ${(e as Error).message}`;
+    }
+    try {
+      y = parseFiniteInt(p.y);
+    } catch (e) {
+      errors[`reroute.replacement_points[${i}].y`] = `Y ${(e as Error).message}`;
+    }
+    return x === null || y === null ? null : { x, y };
+  });
+  if (pts.length < 2) {
+    errors["reroute.replacement_points"] = "替代折点至少包含区间两端两个点";
+  }
+  for (let i = 0; i < pts.length - 1; i++) {
+    const a = pts[i];
+    const b = pts[i + 1];
+    if (a && b && a.x === b.x && a.y === b.y) {
+      errors[`reroute.replacement_points[${i + 1}].x`] =
+        "与上一折点重合，禁止相邻重复节点";
+    }
+  }
+
+  // 端点必须与被替换边界节点精确重合（整数毫米，直接比解析值，不容差）
+  if (start >= 0 && end >= 0 && start < end && pts.length >= 2) {
+    const a = parsedNodes[start];
+    const p0 = pts[0];
+    if (a && p0 && (a.x !== p0.x || a.y !== p0.y)) {
+      errors["reroute.replacement_points[0].x"] =
+        `首个接入折点必须与节点 #${start}（${a.x}, ${a.y}）精确重合`;
+    }
+    const b = parsedNodes[end];
+    const pLast = pts[pts.length - 1];
+    if (b && pLast && (b.x !== pLast.x || b.y !== pLast.y)) {
+      errors[`reroute.replacement_points[${pts.length - 1}].x`] =
+        `末个接入折点必须与节点 #${end}（${b.x}, ${b.y}）精确重合`;
+    }
+  }
 }
 
 /** 解析为后端载荷；调用前应已通过 validateDraft。 */
@@ -187,5 +297,21 @@ export function buildPayload(draft: FormDraft): PrecheckPayload {
       max_rms_error: parsePositiveFinite(draft.maxRmsError),
     };
   }
+  // 未启用改线预览时完全省略 reroute 键，请求与旧版逐项一致。
+  if (draft.reroute.enabled) {
+    payload.reroute = buildReroutePayload(draft);
+  }
   return payload;
+}
+
+/** 解析改线段（调用前应已通过 validateDraft）。 */
+export function buildReroutePayload(draft: FormDraft): ReroutePayload {
+  return {
+    start_index: parseNonNegInt(draft.reroute.startIndex),
+    end_index: parseNonNegInt(draft.reroute.endIndex),
+    replacement_points: draft.reroute.points.map((p) => ({
+      x: parseFiniteInt(p.x),
+      y: parseFiniteInt(p.y),
+    })),
+  };
 }

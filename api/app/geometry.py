@@ -120,6 +120,23 @@ class CompoundIntrusionSegment:
     pieces: Tuple[CompoundPiece, ...]
 
 
+def cumulative_mileage(nodes: Sequence[Point]) -> List[float]:
+    """各节点的累计里程（从 0 起按段长顺序累加）。
+
+    原线与改线候选线必须共用同一段长度累加逻辑：候选线未改动前缀沿用
+    原里程、改线后缀按新路径长度重新累计，里程比较一律以此未舍入结果
+    为准，三位小数只用于展示。
+    """
+    n = len(nodes) - 1
+    cum = [0.0] * (n + 1)
+    for i in range(n):
+        cum[i + 1] = cum[i] + math.hypot(
+            nodes[i + 1][0] - nodes[i][0],
+            nodes[i + 1][1] - nodes[i][1],
+        )
+    return cum
+
+
 def nearest_point_on_segment(p: Point, a: Point, b: Point) -> Tuple[Point, float]:
     """返回点 ``p`` 到闭线段 ``a-b`` 的唯一最近点与距离。
 
@@ -641,12 +658,7 @@ def analyze_path_full(
     n = len(nodes) - 1
 
     # 累计里程：cum[i] = 线段 i 起点的里程。
-    cum = [0.0] * (n + 1)
-    for i in range(n):
-        cum[i + 1] = cum[i] + math.hypot(
-            nodes[i + 1][0] - nodes[i][0],
-            nodes[i + 1][1] - nodes[i][1],
-        )
+    cum = cumulative_mileage(nodes)
 
     pieces: List[SegmentPiece] = []
     collisions: List[Collision] = []

@@ -528,3 +528,94 @@ h2 {
   width: 12px;
   height: 12px;
 }
+
+/* ---------- 一次性改线预览 ---------- */
+
+.reroute-editor {
+  border-left: 3px solid var(--info, #0284c7);
+}
+
+.reroute-range {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 10px 0;
+}
+
+.reroute-range .num-input {
+  width: 90px;
+}
+
+.reroute-actions {
+  margin-top: 12px;
+  align-items: center;
+}
+
+.view-switch {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  border: 1px solid rgba(2, 132, 199, 0.4);
+  border-radius: 10px;
+  background: rgba(2, 132, 199, 0.08);
+}
+
+.reroute-panel {
+  border-left: 3px solid var(--info, #0284c7);
+}
+
+.risk-circle {
+  margin: 10px 0;
+  padding: 8px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  border-radius: 8px;
+}
+
+.risk-circle-title {
+  margin: 0 0 6px;
+  font-size: 0.95rem;
+}
+
+.risk-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.risk-event {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 0.9rem;
+}
+
+.risk-tag {
+  flex: none;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
+.risk-消除 {
+  background: rgba(34, 197, 94, 0.18);
+  color: #15803d;
+  border: 1px solid rgba(34, 197, 94, 0.5);
+}
+
+.risk-新增 {
+  background: rgba(239, 68, 68, 0.15);
+  color: #b91c1c;
+  border: 1px solid rgba(239, 68, 68, 0.5);
+}
+
+.risk-仍存在 {
+  background: rgba(245, 158, 11, 0.16);
+  color: #b45309;
+  border: 1px solid rgba(245, 158, 11, 0.5);
+}
