@@ -123,16 +123,104 @@ A 为峰值活动圈数、R 为输出规模），事件以整数位掩码增量�
 }
 ```
 
+## 一次性改线预览（可选 reroute）
+
+新增钻孔需要把一小段既定电缆**折线改线**时，现场先看改线会**消除**哪些
+侵入、又会在哪些里程**引入新风险**；原方案必须保留供比对。请求可携带可选
+`reroute`，预检在**同一响应快照**内同时给出原线（顶层字段，语义不变）与
+候选改线 `reroute_preview`：
+
+- `start_node_index` / `end_node_index`：**被替换的连续节点区间**两端锚点
+  在 `nodes` 中的下标，必须 `0 ≤ start < end ≤ 末下标`（至少替换一条连续
+  线段，允许整段折线替换）；
+- `replacement_nodes`：接入两锚点之间的**替代折点**（整数毫米，至少 1 个），
+  候选折线 = `nodes[:start+1] + replacement_nodes + nodes[end:]`；
+- **端点衔接与折线有效性**：首折点不得与起始锚点重合、末折点不得与结束
+  锚点重合（禁止零长接入段），相邻折点不得重合；允许自交（与原折线规则
+  一致，自交路径由精确几何照常分析）；任一不满足返回定位明确的 422
+  （`reroute.start_node_index` / `reroute.end_node_index` /
+  `reroute.replacement_nodes[i].x` 等），**不生成任何原线/候选结论**；
+- 原线与候选线用**同一套标定与精确几何规则**（粗筛、精确求交、跨拐点合并、
+  复合段扫描）分别计算，排序与三位小数展示来自各自的同一批未舍入结果。
+
+**里程规则（不依赖三位小数展示值）**：
+
+- 未改动**前缀沿用原里程**：候选累计里程从 0 起做与原线相同的 IEEE-754
+  逐段累加，前缀里程表与原线**逐位相同**；
+- **改线后缀按新路径长度重新累计**：锚点 b 的新里程 = 前缀原里程 + 新路径
+  a→b 长度，后缀事件里程与原线相差固定的 `mileage_shift`（可负）。
+
+**按禁入圈归类的消除/新增/仍存在**（`circle_risks`）：事件同一性按
+**未舍入的 (原线段, 禁入圈输入序) 结构身份**判定——前缀候选段 `i` ↔
+原线段 `i`；后缀候选段 ↔ 同一下标的原线段（里程带平移）；区间内部的旧段
+为消除、替代段为新增。因此：
+
+- **自交路径同坐标异里程**的两个事件是两个独立身份，绝不因坐标相同而
+  合并成同一事件；近相切的三位小数展示相同也不影响归类；
+- 每圈给出 `removed` / `added` / `remaining` 事件明细及圈级 `status`：
+  `remaining`（仅仍存在）、`removed`（仅消除）、`added`（仅新增）、
+  `reduced`（消除+仍存在）、`increased`（新增+仍存在）、`replaced`
+  （消除+新增）；`remaining` 同时给出原线/候选双份里程与该事件的
+  `mileage_shift`（前缀 0、后缀固定平移）；
+- `summary` 给事件数与按圈状态计数、两条线的总里程与平移；
+- **省略 `reroute` 时响应 `reroute_preview` 为 `null`，旧接口逐项兼容；
+  不提交改线时前端旧交互保持原样。**
+
+```json
+{
+  "reroute": {
+    "start_node_index": 0,
+    "end_node_index": 1,
+    "replacement_nodes": [{"x": -50, "y": 31}, {"x": 50, "y": 31}]
+  }
+}
+```
+
+`reroute_preview`（节选）：
+
+```json
+{
+  "start_node_index": 0,
+  "end_node_index": 1,
+  "replacement_nodes": [{"x": -50.0, "y": 31.0}, {"x": 50.0, "y": 31.0}],
+  "junction_start": {"x": -100.0, "y": 0.0},
+  "junction_end": {"x": 100.0, "y": 0.0},
+  "prefix_length": 0.0,
+  "original_junction_end_mileage": 200.0,
+  "candidate_junction_end_mileage": 222.8,
+  "mileage_shift": 22.8,
+  "candidate": { "feasible": true, "collision_count": 0, "...": "全套 PrecheckResponse" },
+  "circle_risks": [
+    {
+      "circle_index": 0, "status": "removed",
+      "removed": [{"segment_index": 0, "entry": {"x": 0.0, "y": 0.0},
+                   "start_mileage": 100.0, "end_mileage": 100.0, "length": 0.0}],
+      "added": [], "remaining": []
+    }
+  ],
+  "summary": { "circle_count": 1, "removed_event_count": 1, "added_event_count": 0,
+               "remaining_event_count": 0, "mileage_shift": 22.8 }
+}
+```
+
+前端在**同一版本快照**内切换原线/候选线：SVG、碰撞横幅、连续侵入区间与
+复合段详情随「原线（已保存方案）/ 候选改线」标签同步切换，风险摘要固定在
+原线比对视图；**取消预览、预览校验失败（本地不发请求或后端 422）、在途预览
+乱序返回都不覆盖已保存原方案**（预览走独立请求序号）；正式提交才替换快照。
+
 
 ## 技术栈
 
 - 后端：Python 3.12 + FastAPI + Pydantic v2（`api/`）
 - 前端：TypeScript + React 18 + Vite（`web/`），SVG 绘制路径、禁入圈与判定位置
 - 测试：pytest（穿越/端点/相切/圈内线段/排序/字段错误/连续侵入区间合并与独立边界/
-  粗筛不漏候选/20000×2000 稀疏性能/标定独立矩阵核对与退化、镜像、大坐标）、
+  粗筛不漏候选/20000×2000 稀疏性能/标定独立矩阵核对与退化、镜像、大坐标/
+  改线预览独立小夹具：切点消除与新增、跨拐点、标定同源、前缀逐位里程与后缀
+  平移、自交同坐标异里程独立、端点衔接 422、increased/reduced 状态）、
   Vitest + Testing Library
   （录入校验、**真实 HTTP 请求**、首个碰撞高亮、侵入区间明细与 SVG 片段高亮、
-  拐点双相切合并、重叠禁入圈、标定摘要与 422 作废、乱序响应作废与旧结论清除）
+  拐点双相切合并、重叠禁入圈、标定摘要与 422 作废、乱序响应作废与旧结论清除、
+  改线预览原线/候选线视图一致性、取消/422/在途乱序不覆盖已保存原方案）
 
 ## 目录
 
@@ -140,15 +228,16 @@ A 为峰值活动圈数、R 为输出规模），事件以整数位掩码增量�
 api/                       FastAPI 服务
   app/geometry.py          自实现二维：最近点 + 碰撞检测 + 闭集区间/跨拐点合并/空间粗筛（双精度）
   app/calibration.py       survey→path 最小二乘刚体标定（仅旋转+平移，双精度，fsum 累加）
-  app/schemas.py           Pydantic 模型与字段级校验（含 calibration 结构校验）
+  app/reroute.py           一次性改线：候选折线构造 + 未舍入结构身份比对（消除/新增/仍存在、里程平移）
+  app/schemas.py           Pydantic 模型与字段级校验（含 calibration、reroute 结构校验）
   app/main.py              /api/precheck、/api/health、422 字段错误
   tests/                   pytest（碰撞、区间语义、合并边界、性能与错误、
-                           标定：独立矩阵计算核对纯平移/九十度旋转/噪声/超阈值/
-                           退化/镜像/大坐标，标定后相切与复合侵入同源性）
+                           标定、改线预览小夹具：切点/跨拐点/标定/里程平移/自交/422）
 web/                       React + Vite
-  src/lib/validation.ts    前端同构校验（字段键与后端一致，含 calibration.*）
+  src/lib/validation.ts    前端同构校验（字段键与后端一致，含 calibration.*、reroute.*）
   src/components/Scene.tsx SVG 场景（路径/禁入圈/扩张圈/判定位置/侵入区间片段）
-  src/test/App.real.test.tsx  对真实运行 API 的 Vitest 验收（含标定全流程）
+  src/App.reroute.test.tsx 改线预览：视图一致性、取消/422/乱序不覆盖原方案（fetch 桩）
+  src/test/App.real.test.tsx  对真实运行 API 的 Vitest 验收（含标定、改线全流程）
 Dockerfile.verify          验收镜像（Python 3.12 + Node 20）
 docker-compose.yml         web / api / verify（一次性）
 scripts/verify.sh          验收编排

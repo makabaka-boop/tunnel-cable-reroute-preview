@@ -10,10 +10,15 @@ import {
   type NodeDraft,
 } from "./lib/validation";
 import type {
+  CircleRisks,
   CompoundIntrusionSegment,
   FieldErrors,
   IntrusionInterval,
   PrecheckResponse,
+  RerouteEvent,
+  ReroutePreview,
+  RerouteRemaining,
+  RerouteSummary,
 } from "./types";
 import "./App.css";
 
@@ -56,6 +61,15 @@ const initialDraft: FormDraft = {
   calibrationEnabled: false,
   maxRmsError: "1",
   calibrationPairs: [emptyPair(), emptyPair()],
+  reroute: {
+    enabled: false,
+    startNodeIndex: "0",
+    endNodeIndex: "1",
+    replacementNodes: [
+      { x: "-50", y: "31" },
+      { x: "50", y: "31" },
+    ],
+  },
 };
 
 const fmt = (n: number) => String(n);
@@ -157,8 +171,107 @@ function CompoundRow({ seg, order }: { seg: CompoundIntrusionSegment; order: num
   );
 }
 
+const STATUS_LABELS: Record<CircleRisks["status"], string> = {
+  remaining: "仍存在",
+  removed: "已消除",
+  added: "新增风险",
+  reduced: "部分消除（仍有残留）",
+  increased: "仍存在 + 新增",
+  replaced: "消除 + 新增（换了位置）",
+};
+
+function RiskEventRow({ ev, kind }: { ev: RerouteEvent; kind: "removed" | "added" }) {
+  const zero = ev.length === 0;
+  return (
+    <li
+      className={`risk-event risk-${kind}`}
+      data-testid={`risk-${kind}-c${ev.circle_index}-s${ev.segment_index}`}
+    >
+      {kind === "removed" ? "消除" : "新增"} · 候选/原线段 #{ev.segment_index}：
+      ({fmt(ev.entry.x)}, {fmt(ev.entry.y)}) → ({fmt(ev.exit.x)}, {fmt(ev.exit.y)})
+      ，里程 {fmt(ev.start_mileage)} → {fmt(ev.end_mileage)} mm
+      {zero ? "（相切零长点）" : `，长 ${fmt(ev.length)} mm`}
+    </li>
+  );
+}
+
+function RiskRemainingRow({ rp }: { rp: RerouteRemaining }) {
+  return (
+    <li
+      className="risk-event risk-remaining"
+      data-testid={`risk-remaining-c${rp.circle_index}-s${rp.original_segment_index}`}
+    >
+      仍存在 · 原线段 #{rp.original_segment_index} ↔ 候选段 #{rp.candidate_segment_index}：
+      ({fmt(rp.entry.x)}, {fmt(rp.entry.y)})，原里程 {fmt(rp.original_start_mileage)} →
+      {" "}{fmt(rp.original_end_mileage)}，候选里程 {fmt(rp.candidate_start_mileage)} →
+      {" "}{fmt(rp.candidate_end_mileage)} mm
+      {rp.mileage_shift === 0
+        ? "（前缀里程逐位不变）"
+        : `（后缀平移 ${fmt(rp.mileage_shift)} mm）`}
+    </li>
+  );
+}
+
+function CircleRiskBlock({ cr }: { cr: CircleRisks }) {
+  return (
+    <li className="circle-risk" data-testid={`circle-risk-${cr.circle_index}`}>
+      <div className="interval-head">
+        <span className="interval-circle">禁入圈 #{cr.circle_index}</span>
+        <span
+          className={`interval-badge risk-status-${cr.status}`}
+          data-testid={`circle-risk-${cr.circle_index}-status`}
+        >
+          {STATUS_LABELS[cr.status]}
+        </span>
+      </div>
+      {(cr.removed.length > 0 || cr.added.length > 0 || cr.remaining.length > 0) && (
+        <ul className="risk-event-list">
+          {cr.removed.map((ev) => (
+            <RiskEventRow
+              key={`rm-${ev.segment_index}-${ev.start_mileage}`}
+              ev={ev}
+              kind="removed"
+            />
+          ))}
+          {cr.added.map((ev) => (
+            <RiskEventRow
+              key={`add-${ev.segment_index}-${ev.start_mileage}`}
+              ev={ev}
+              kind="added"
+            />
+          ))}
+          {cr.remaining.map((rp) => (
+            <RiskRemainingRow
+              key={`stay-${rp.original_segment_index}-${rp.original_start_mileage}`}
+              rp={rp}
+            />
+          ))}
+        </ul>
+      )}
+    </li>
+  );
+}
+
+function RerouteSummaryBar({ summary }: { summary: RerouteSummary }) {
+  return (
+    <div className="reroute-summary" data-testid="reroute-summary">
+      <span data-testid="reroute-summary-events">
+        消除 {summary.removed_event_count} 处 · 新增 {summary.added_event_count} 处 ·
+        仍存在 {summary.remaining_event_count} 处
+      </span>
+      <span data-testid="reroute-summary-length">
+        路径总长 {fmt(summary.original_total_length)} →{" "}
+        {fmt(summary.candidate_total_length)} mm（后缀里程平移{" "}
+        {summary.mileage_shift > 0 ? "+" : ""}
+        {fmt(summary.mileage_shift)} mm）
+      </span>
+    </div>
+  );
+}
+
 export function App() {
   const [draft, setDraft] = useState<FormDraft>(initialDraft);
+  // 已保存（提交成功）的原方案；取消预览 / 校验失败 / 在途乱序都不能覆盖它。
   const [result, setResult] = useState<PrecheckResponse | null>(null);
   const [errors, setErrors] = useState<FieldErrors>({});
   const [networkError, setNetworkError] = useState<string | null>(null);
@@ -166,6 +279,16 @@ export function App() {
   // 每次“新提交/校验失败/请求失败/重置”自增；在途旧响应回来时凭它作废，
   // 保证旧结论（含侵入区间）永远不会在新状态之后“复活”。
   const requestSeq = useRef(0);
+
+  // ---- 一次性改线预览：独立快照、独立请求序号、独立错误/加载状态 ----
+  // preview 是“同一次响应快照”：顶层即原线，reroute_preview 为候选线，
+  // viewMode 只在这同一快照内切换 SVG 与区间详情。
+  const [preview, setPreview] = useState<ReroutePreview | null>(null);
+  const [previewErrors, setPreviewErrors] = useState<FieldErrors>({});
+  const [previewNetworkError, setPreviewNetworkError] = useState<string | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [viewMode, setViewMode] = useState<"original" | "candidate">("original");
+  const previewSeq = useRef(0);
 
   const updateNode = (i: number, patch: Partial<NodeDraft>) => {
     setDraft((d) => ({
@@ -187,11 +310,29 @@ export function App() {
       ),
     }));
   };
+  const updateRerouteNode = (i: number, patch: Partial<NodeDraft>) => {
+    setDraft((d) => ({
+      ...d,
+      reroute: {
+        ...d.reroute,
+        replacementNodes: d.reroute.replacementNodes.map((p, idx) =>
+          idx === i ? { ...p, ...patch } : p,
+        ),
+      },
+    }));
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     // 任何新的提交都先使旧请求失效并清除旧结论与错误。
     const seq = ++requestSeq.current;
+    // 新的正式提交同时作废旧预览（保存的是本次新快照）。
+    previewSeq.current += 1;
+    setPreview(null);
+    setPreviewErrors({});
+    setPreviewNetworkError(null);
+    setPreviewLoading(false);
+    setViewMode("original");
     setResult(null);
     setErrors({});
     setNetworkError(null);
@@ -208,6 +349,9 @@ export function App() {
       // 在途旧响应（用户已再次提交/重置/后发请求）不得覆盖新状态。
       if (seq !== requestSeq.current) return;
       setResult(data);
+      if (data.reroute_preview) {
+        setPreview(data.reroute_preview);
+      }
     } catch (e) {
       if (seq !== requestSeq.current) return;
       if (e instanceof ValidationError) {
@@ -221,19 +365,73 @@ export function App() {
     }
   };
 
+  /** 一次性改线预览：不动已保存原方案；独立序号拦截乱序响应。 */
+  const handlePreview = async () => {
+    const seq = ++previewSeq.current;
+    setPreviewErrors({});
+    setPreviewNetworkError(null);
+    const fieldErrors = validateDraft(draft);
+    if (Object.keys(fieldErrors).length > 0) {
+      // 预览校验失败：作废本预览，绝不清空/覆盖已保存的原方案。
+      setPreviewErrors(fieldErrors);
+      return;
+    }
+    setPreviewLoading(true);
+    try {
+      const data = await precheck(buildPayload(draft));
+      if (seq !== previewSeq.current) return; // 乱序/已取消的旧响应
+      if (!data.reroute_preview) {
+        setPreviewErrors({ reroute: "响应未包含改线预览" });
+      } else {
+        setResult(data); // 同一版本快照的原线结论
+        setPreview(data.reroute_preview);
+        setViewMode("original");
+      }
+    } catch (e) {
+      if (seq !== previewSeq.current) return;
+      if (e instanceof ValidationError) {
+        setPreviewErrors(e.errors);
+      } else {
+        setPreviewNetworkError((e as Error).message);
+      }
+    } finally {
+      if (seq === previewSeq.current) setPreviewLoading(false);
+    }
+  };
+
+  /** 取消预览：回到已保存原方案（绝不重新请求、绝不覆盖）。 */
+  const handleCancelPreview = () => {
+    previewSeq.current += 1; // 在途预览响应一律作废
+    setPreview(null);
+    setPreviewErrors({});
+    setPreviewNetworkError(null);
+    setPreviewLoading(false);
+    setViewMode("original");
+  };
+
   const handleReset = () => {
     requestSeq.current += 1; // 在途响应作废
+    previewSeq.current += 1;
     setDraft(initialDraft);
     setResult(null);
     setErrors({});
     setNetworkError(null);
     setLoading(false);
+    setPreview(null);
+    setPreviewErrors({});
+    setPreviewNetworkError(null);
+    setPreviewLoading(false);
+    setViewMode("original");
   };
 
   // 后端按 (线段下标, 禁入圈输入顺序) 确定首个碰撞；页面必须直接使用该结果，
   // 不能再按距离自行改排，否则“首个”和“其余”会与接口明细不一致。
-  const first = result?.first_collision ?? null;
-  const rest = result ? result.collisions.slice(1) : [];
+  // 在改线快照内切换原线/候选线时，SVG 与区间详情使用同一份 viewResult，
+  // 保证“图上高亮”和“文案区间”始终来自同一视图。
+  const viewResult: PrecheckResponse | null =
+    preview && viewMode === "candidate" ? preview.candidate : result;
+  const first = viewResult?.first_collision ?? null;
+  const rest = viewResult ? viewResult.collisions.slice(1) : [];
 
   return (
     <div className="page">
@@ -532,6 +730,195 @@ export function App() {
             )}
           </section>
 
+          <section>
+            <div className="row-head">
+              <h2>一次性改线预览（可选）：替换连续节点区间</h2>
+              <label className="calibration-toggle">
+                <input
+                  type="checkbox"
+                  data-testid="reroute-enabled"
+                  checked={draft.reroute.enabled}
+                  onChange={(e) =>
+                    setDraft((d) => ({
+                      ...d,
+                      reroute: { ...d.reroute, enabled: e.target.checked },
+                    }))
+                  }
+                />
+                启用改线预览
+              </label>
+            </div>
+            {draft.reroute.enabled && (
+              <div className="calibration-editor" data-testid="reroute-editor">
+                <p className="hint">
+                  指定被替换的连续节点区间（两端锚点保留）与接入两端的替代折点；
+                  未改动前缀沿用原里程，后缀按新路径长度重新累计。原方案始终保留供比对。
+                </p>
+                <div className="reroute-indices">
+                  <span className="row-index">替换节点区间</span>
+                  <NumInput
+                    value={draft.reroute.startNodeIndex}
+                    testid="reroute-start"
+                    ariaLabel="起始节点下标"
+                    invalid={hasErr(errors, "reroute.start_node_index") ||
+                      hasErr(previewErrors, "reroute.start_node_index")}
+                    onChange={(v) =>
+                      setDraft((d) => ({
+                        ...d,
+                        reroute: { ...d.reroute, startNodeIndex: v },
+                      }))
+                    }
+                  />
+                  <span>→</span>
+                  <NumInput
+                    value={draft.reroute.endNodeIndex}
+                    testid="reroute-end"
+                    ariaLabel="结束节点下标"
+                    invalid={hasErr(errors, "reroute.end_node_index") ||
+                      hasErr(previewErrors, "reroute.end_node_index")}
+                    onChange={(v) =>
+                      setDraft((d) => ({
+                        ...d,
+                        reroute: { ...d.reroute, endNodeIndex: v },
+                      }))
+                    }
+                  />
+                </div>
+                {(err(errors, "reroute.start_node_index") ||
+                  err(previewErrors, "reroute.start_node_index")) && (
+                  <p className="field-error" data-testid="err-reroute.start_node_index">
+                    {err(errors, "reroute.start_node_index") ??
+                      err(previewErrors, "reroute.start_node_index")}
+                  </p>
+                )}
+                {(err(errors, "reroute.end_node_index") ||
+                  err(previewErrors, "reroute.end_node_index")) && (
+                  <p className="field-error" data-testid="err-reroute.end_node_index">
+                    {err(errors, "reroute.end_node_index") ??
+                      err(previewErrors, "reroute.end_node_index")}
+                  </p>
+                )}
+                {(err(errors, "reroute") || err(previewErrors, "reroute")) && (
+                  <p className="field-error" data-testid="err-reroute">
+                    {err(errors, "reroute") ?? err(previewErrors, "reroute")}
+                  </p>
+                )}
+                <div className="row-head">
+                  <h3>替代折点（整数毫米，至少 1 个，内部拐点）</h3>
+                  <button
+                    type="button"
+                    className="btn small"
+                    data-testid="add-reroute-node"
+                    onClick={() =>
+                      setDraft((d) => ({
+                        ...d,
+                        reroute: {
+                          ...d.reroute,
+                          replacementNodes: [
+                            ...d.reroute.replacementNodes,
+                            { x: "0", y: "0" },
+                          ],
+                        },
+                      }))
+                    }
+                  >
+                    + 折点
+                  </button>
+                </div>
+                {(err(errors, "reroute.replacement_nodes") ||
+                  err(previewErrors, "reroute.replacement_nodes")) && (
+                  <p className="field-error" data-testid="err-reroute.replacement_nodes">
+                    {err(errors, "reroute.replacement_nodes") ??
+                      err(previewErrors, "reroute.replacement_nodes")}
+                  </p>
+                )}
+                <ol className="rows" data-testid="reroute-node-list">
+                  {draft.reroute.replacementNodes.map((p, i) => (
+                    <li key={i} className="row">
+                      <span className="row-index">折点{i}</span>
+                      <NumInput
+                        value={p.x}
+                        testid={`reroute-node-${i}-x`}
+                        ariaLabel={`替代折点 ${i} X`}
+                        invalid={
+                          hasErr(errors, `reroute.replacement_nodes[${i}].x`) ||
+                          hasErr(previewErrors, `reroute.replacement_nodes[${i}].x`)
+                        }
+                        onChange={(v) => updateRerouteNode(i, { x: v })}
+                      />
+                      <NumInput
+                        value={p.y}
+                        testid={`reroute-node-${i}-y`}
+                        ariaLabel={`替代折点 ${i} Y`}
+                        invalid={
+                          hasErr(errors, `reroute.replacement_nodes[${i}].y`) ||
+                          hasErr(previewErrors, `reroute.replacement_nodes[${i}].y`)
+                        }
+                        onChange={(v) => updateRerouteNode(i, { y: v })}
+                      />
+                      <button
+                        type="button"
+                        className="btn ghost small"
+                        aria-label={`删除替代折点 ${i}`}
+                        data-testid={`remove-reroute-node-${i}`}
+                        disabled={draft.reroute.replacementNodes.length <= 1}
+                        onClick={() =>
+                          setDraft((d) => ({
+                            ...d,
+                            reroute: {
+                              ...d.reroute,
+                              replacementNodes: d.reroute.replacementNodes.filter(
+                                (_, idx) => idx !== i,
+                              ),
+                            },
+                          }))
+                        }
+                      >
+                        删除
+                      </button>
+                      {(err(errors, `reroute.replacement_nodes[${i}].x`) ||
+                        err(previewErrors, `reroute.replacement_nodes[${i}].x`) ||
+                        err(errors, `reroute.replacement_nodes[${i}].y`) ||
+                        err(previewErrors, `reroute.replacement_nodes[${i}].y`)) && (
+                          <p className="field-error row-error">
+                            {err(errors, `reroute.replacement_nodes[${i}].x`) ??
+                              err(previewErrors, `reroute.replacement_nodes[${i}].x`) ??
+                              err(errors, `reroute.replacement_nodes[${i}].y`) ??
+                              err(previewErrors, `reroute.replacement_nodes[${i}].y`)}
+                          </p>
+                        )}
+                    </li>
+                  ))}
+                </ol>
+                <div className="actions reroute-actions">
+                  <button
+                    type="button"
+                    className="btn"
+                    data-testid="reroute-preview"
+                    onClick={handlePreview}
+                  >
+                    {previewLoading ? "重新预览（在途请求自动作废）" : "改线预览（原方案保留）"}
+                  </button>
+                  {(preview || previewLoading) && (
+                    <button
+                      type="button"
+                      className="btn ghost"
+                      data-testid="reroute-cancel"
+                      onClick={handleCancelPreview}
+                    >
+                      取消预览
+                    </button>
+                  )}
+                </div>
+                {previewNetworkError && (
+                  <p className="field-error" data-testid="reroute-network-error">
+                    预览请求失败：{previewNetworkError}（原方案未改动）
+                  </p>
+                )}
+              </div>
+            )}
+          </section>
+
           <div className="actions">
             <button type="submit" className="btn primary" data-testid="submit" disabled={loading}>
               {loading ? "预检中…" : "开始预检"}
@@ -563,39 +950,85 @@ export function App() {
             </div>
           )}
 
-          {result && result.calibration && (
+          {preview && Object.keys(previewErrors).length === 0 && (
+            <div className="reroute-toolbar" data-testid="reroute-toolbar">
+              <div className="view-toggle" role="tablist" aria-label="原线/候选线切换">
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={viewMode === "original"}
+                  className={`btn small toggle-btn${viewMode === "original" ? " active" : ""}`}
+                  data-testid="view-original"
+                  onClick={() => setViewMode("original")}
+                >
+                  原线（已保存方案）
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={viewMode === "candidate"}
+                  className={`btn small toggle-btn${viewMode === "candidate" ? " active" : ""}`}
+                  data-testid="view-candidate"
+                  onClick={() => setViewMode("candidate")}
+                >
+                  候选改线
+                </button>
+              </div>
+              <button
+                type="button"
+                className="btn ghost small"
+                data-testid="reroute-cancel-2"
+                onClick={handleCancelPreview}
+              >
+                取消预览
+              </button>
+            </div>
+          )}
+
+          {Object.keys(previewErrors).length > 0 && (
+            <div className="banner error" data-testid="reroute-banner-error">
+              <strong>改线预览未执行：</strong>
+              存在 {Object.keys(previewErrors).length} 个字段错误，
+              已保存的原方案保留不变（可切换回原线视图）。
+            </div>
+          )}
+
+          {viewResult && viewResult.calibration && (
             <div className="interval-panel calibration-panel" data-testid="calibration-panel">
               <h2 className="interval-title">
-                标定结果（survey → path 刚体变换，{result.calibration.point_count} 对控制点）
+                标定结果（survey → path 刚体变换，{viewResult.calibration.point_count} 对控制点）
               </h2>
               <div className="calibration-summary">
                 <p data-testid="calibration-rms">
-                  残差 RMS：{fmt(result.calibration.rms_error)} mm
+                  残差 RMS：{fmt(viewResult.calibration.rms_error)} mm
                 </p>
                 <p data-testid="calibration-rotation">
-                  旋转矩阵：[[{fmt(result.calibration.rotation[0][0])},{" "}
-                  {fmt(result.calibration.rotation[0][1])}], [
-                  {fmt(result.calibration.rotation[1][0])},{" "}
-                  {fmt(result.calibration.rotation[1][1])}]]
+                  旋转矩阵：[[{fmt(viewResult.calibration.rotation[0][0])},{" "}
+                  {fmt(viewResult.calibration.rotation[0][1])}], [
+                  {fmt(viewResult.calibration.rotation[1][0])},{" "}
+                  {fmt(viewResult.calibration.rotation[1][1])}]]
                 </p>
                 <p data-testid="calibration-translation">
-                  平移：({fmt(result.calibration.translation.x)},{" "}
-                  {fmt(result.calibration.translation.y)}) mm
+                  平移：({fmt(viewResult.calibration.translation.x)},{" "}
+                  {fmt(viewResult.calibration.translation.y)}) mm
                 </p>
               </div>
             </div>
           )}
 
-          {result && result.feasible && (
+          {viewResult && viewResult.feasible && (
             <div className="banner ok" data-testid="banner-ok">
-              <strong>✅ 可敷设</strong>
+              <strong>{preview && viewMode === "candidate" ? "✅ 候选线可敷设" : "✅ 可敷设"}</strong>
               <span>所有线段均在扩张安全圈之外（相切亦视为碰撞）。</span>
             </div>
           )}
 
-          {result && !result.feasible && first && (
+          {viewResult && !viewResult.feasible && first && (
             <div className="banner collision" data-testid="banner-collision">
-              <strong>⛔ 不可敷设：{result.collision_count} 处碰撞</strong>
+              <strong>
+                ⛔ {viewMode === "candidate" ? "候选线" : ""}不可敷设：
+                {viewResult.collision_count} 处碰撞
+              </strong>
               <div className="first-detail" data-testid="first-collision-detail">
                 首个碰撞：线段 #{first.segment_index} × 禁入圈 #{first.circle_index}
                 ，判定位置（最近点）= ({first.nearest.x}, {first.nearest.y}) mm，
@@ -618,27 +1051,52 @@ export function App() {
             </div>
           )}
 
-          {result && !result.feasible && result.intrusion_intervals.length > 0 && (
+          {preview && viewMode === "original" && (
+            <div className="interval-panel reroute-diff-panel" data-testid="reroute-diff-panel">
+              <h2 className="interval-title">改线风险摘要（按禁入圈归类：消除 / 新增 / 仍存在）</h2>
+              <RerouteSummaryBar summary={preview.summary} />
+              {preview.circle_risks.length === 0 ? (
+                <p className="hint">原线与候选线均无侵入风险。</p>
+              ) : (
+                <ol className="interval-list" data-testid="circle-risk-list">
+                  {preview.circle_risks.map((cr) => (
+                    <CircleRiskBlock key={cr.circle_index} cr={cr} />
+                  ))}
+                </ol>
+              )}
+              <p className="hint reroute-mileage-note" data-testid="reroute-mileage-note">
+                锚点：起点 ({fmt(preview.junction_start.x)}, {fmt(preview.junction_start.y)})
+                里程 {fmt(preview.prefix_length)} mm（前缀逐位沿用）；终点
+                ({fmt(preview.junction_end.x)}, {fmt(preview.junction_end.y)})
+                原里程 {fmt(preview.original_junction_end_mileage)} → 候选里程{" "}
+                {fmt(preview.candidate_junction_end_mileage)} mm，后缀平移{" "}
+                {preview.mileage_shift > 0 ? "+" : ""}
+                {fmt(preview.mileage_shift)} mm。
+              </p>
+            </div>
+          )}
+
+          {viewResult && !viewResult.feasible && viewResult.intrusion_intervals.length > 0 && (
             <div className="interval-panel" data-testid="interval-panel">
               <h2 className="interval-title">
-                连续侵入区间（{result.intrusion_intervals.length} 个，按起始里程排序）
+                连续侵入区间（{viewResult.intrusion_intervals.length} 个，按起始里程排序）
               </h2>
               <ol className="interval-list" data-testid="interval-list">
-                {result.intrusion_intervals.map((iv, order) => (
+                {viewResult.intrusion_intervals.map((iv, order) => (
                   <IntervalRow key={`${order}-${iv.circle_index}`} iv={iv} order={order} />
                 ))}
               </ol>
             </div>
           )}
 
-          {result && result.compound_intrusion_segments.length > 0 && (
+          {viewResult && viewResult.compound_intrusion_segments.length > 0 && (
             <div className="interval-panel" data-testid="compound-panel">
               <h2 className="interval-title">
-                复合侵入段（{result.compound_intrusion_segments.length} 个，
+                复合侵入段（{viewResult.compound_intrusion_segments.length} 个，
                 同时落入至少两个扩张圈，按起始里程与圈序排列）
               </h2>
               <ol className="interval-list" data-testid="compound-list">
-                {result.compound_intrusion_segments.map((seg, order) => (
+                {viewResult.compound_intrusion_segments.map((seg, order) => (
                   <CompoundRow
                     key={`${order}-${seg.circle_indices.join("-")}-${seg.start_mileage}`}
                     seg={seg}
@@ -649,14 +1107,14 @@ export function App() {
             </div>
           )}
 
-          {result && (
+          {viewResult && (
             <>
-              <Scene result={result} />
+              <Scene result={viewResult} />
               <p className="legend">
                 <span className="lg lg-solid" /> 禁入圈（孔半径）
                 <span className="lg lg-dashed" /> 扩张安全圈（孔半径+电缆半径）
                 <span className="lg lg-intrusion" /> 连续侵入区间
-                {result.compound_intrusion_segments.length > 0 && (
+                {viewResult.compound_intrusion_segments.length > 0 && (
                   <>
                     <span className="lg lg-compound" /> 复合侵入段（≥2 圈）
                   </>

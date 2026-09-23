@@ -603,4 +603,69 @@ describe("真实请求 + 录入 + 高亮（App）", () => {
     expect(screen.queryByTestId("calibration-panel")).not.toBeInTheDocument();
     vi.unstubAllGlobals();
   });
+
+  // ---------- 一次性改线预览（真实 HTTP）----------
+
+  it("改线预览：同一快照切换原线/候选线，风险摘要显示消除，取消后原方案仍在", async () => {
+    render(<App />);
+    // 默认示例：原线 (-100,0)→(100,0) 与圈 (0,15) r10 相切（碰撞）
+    await userEvent.click(screen.getByTestId("reroute-enabled"));
+    // 折点默认 (-50,31)：顶段 y=31，扩张半径 15，垂距 16 > 15，候选可敷设
+    await userEvent.click(screen.getByTestId("reroute-preview"));
+
+    // 原线视图：碰撞 + 风险摘要（圈0 已消除）
+    await waitFor(() =>
+      expect(screen.getByTestId("reroute-toolbar")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("banner-collision")).toBeInTheDocument();
+    expect(screen.getByTestId("circle-risk-0-status").textContent).toContain("已消除");
+    expect(
+      document.querySelector('[data-testid="risk-removed-c0-s0"]'),
+    ).toBeInTheDocument();
+    // 原线 SVG 切点高亮
+    expect(document.querySelector('[data-testid="intrusion-c0-s0"]')).toBeInTheDocument();
+
+    // 切到候选线：可敷设、无侵入片段
+    await userEvent.click(screen.getByTestId("view-candidate"));
+    await waitFor(() => expect(screen.getByTestId("banner-ok")).toBeInTheDocument());
+    expect(screen.queryByTestId("interval-panel")).not.toBeInTheDocument();
+    // 候选节点 4 个（两锚点 + 两折点）
+    expect(screen.getByTestId("node-3")).toBeInTheDocument();
+    // 候选视角不应出现风险摘要（摘要属于原线比对视图）
+    expect(screen.queryByTestId("reroute-diff-panel")).not.toBeInTheDocument();
+
+    // 切回原线再取消：原方案保留
+    await userEvent.click(screen.getByTestId("view-original"));
+    expect(screen.getByTestId("reroute-diff-panel")).toBeInTheDocument();
+    await userEvent.click(screen.getByTestId("reroute-cancel"));
+    expect(screen.queryByTestId("reroute-toolbar")).not.toBeInTheDocument();
+    expect(screen.getByTestId("banner-collision")).toBeInTheDocument();
+    expect(screen.getByTestId("scene")).toBeInTheDocument();
+  });
+
+  it("改线预览校验失败（start≥end）：422 字段错误且原方案保留", async () => {
+    render(<App />);
+    // 先保存一个原方案
+    await submit();
+    await waitFor(() =>
+      expect(screen.getByTestId("banner-collision")).toBeInTheDocument(),
+    );
+
+    await userEvent.click(screen.getByTestId("reroute-enabled"));
+    await userEvent.clear(screen.getByTestId("reroute-start"));
+    await userEvent.type(screen.getByTestId("reroute-start"), "1");
+    await userEvent.clear(screen.getByTestId("reroute-end"));
+    await userEvent.type(screen.getByTestId("reroute-end"), "0");
+    // 本地校验即拦截，不发请求
+    await userEvent.click(screen.getByTestId("reroute-preview"));
+    await waitFor(() =>
+      expect(screen.getByTestId("reroute-banner-error")).toBeInTheDocument(),
+    );
+    expect(
+      screen.getByTestId("err-reroute.end_node_index").textContent,
+    ).toContain("严格大于");
+    // 已保存原方案仍在
+    expect(screen.getByTestId("banner-collision")).toBeInTheDocument();
+    expect(screen.getByTestId("scene")).toBeInTheDocument();
+  });
 });

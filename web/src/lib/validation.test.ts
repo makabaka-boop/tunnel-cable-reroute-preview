@@ -14,6 +14,12 @@ const okDraft: FormDraft = {
     { surveyX: "", surveyY: "", pathX: "", pathY: "" },
     { surveyX: "", surveyY: "", pathX: "", pathY: "" },
   ],
+  reroute: {
+    enabled: false,
+    startNodeIndex: "0",
+    endNodeIndex: "1",
+    replacementNodes: [{ x: "50", y: "40" }],
+  },
 };
 
 /** 启用标定的合法草稿：纯平移 survey = path + (1000, 2000)。 */
@@ -92,6 +98,12 @@ describe("录入校验 validateDraft（与后端字段键一致）", () => {
       calibrationEnabled: false,
       maxRmsError: "1",
       calibrationPairs: [],
+      reroute: {
+        enabled: false,
+        startNodeIndex: "0",
+        endNodeIndex: "1",
+        replacementNodes: [],
+      },
     };
     const errors = validateDraft(d);
     expect(Object.keys(errors).sort()).toEqual(
@@ -184,5 +196,67 @@ describe("现场标定校验（字段键与后端 calibration.* 一致）", () =
       const d: FormDraft = { ...calibratedDraft, maxRmsError: bad };
       expect(validateDraft(d)["calibration.max_rms_error"], `bad=${bad}`).toBeTruthy();
     }
+  });
+});
+
+describe("一次性改线预览校验（字段键与后端 reroute.* 一致）", () => {
+  const enabled = (patch: Partial<FormDraft["reroute"]> = {}): FormDraft => ({
+    ...okDraft,
+    reroute: { ...okDraft.reroute, enabled: true, ...patch },
+  });
+
+  it("未启用：不校验、载荷省略 reroute 键（旧接口保持原样）", () => {
+    const d: FormDraft = {
+      ...okDraft,
+      reroute: { ...okDraft.reroute, replacementNodes: [] },
+    };
+    expect(validateDraft(d)).toEqual({});
+    expect("reroute" in buildPayload(d)).toBe(false);
+  });
+
+  it("合法预览：载荷带 reroute，下标/折点按整数解析", () => {
+    const d = enabled();
+    expect(validateDraft(d)).toEqual({});
+    expect(buildPayload(d).reroute).toEqual({
+      start_node_index: 0,
+      end_node_index: 1,
+      replacement_nodes: [{ x: 50, y: 40 }],
+    });
+  });
+
+  it("下标非负整数且 start < end，且不能越界", () => {
+    expect(validateDraft(enabled({ startNodeIndex: "-1" }))["reroute.start_node_index"]).toBeTruthy();
+    expect(validateDraft(enabled({ startNodeIndex: "1.5" }))["reroute.start_node_index"]).toBeTruthy();
+    expect(validateDraft(enabled({ endNodeIndex: "0" }))["reroute.end_node_index"]).toContain("严格大于");
+    expect(validateDraft(enabled({ startNodeIndex: "9" }))["reroute.start_node_index"]).toContain("超出");
+    expect(validateDraft(enabled({ endNodeIndex: "9" }))["reroute.end_node_index"]).toContain("超出");
+  });
+
+  it("至少一个替代折点且坐标为整数毫米", () => {
+    const d = enabled({ replacementNodes: [] });
+    expect(validateDraft(d)["reroute.replacement_nodes"]).toContain("至少");
+    const d2 = enabled({ replacementNodes: [{ x: "1.5", y: "0" }] });
+    expect(validateDraft(d2)["reroute.replacement_nodes[0].x"]).toBeTruthy();
+  });
+
+  it("相邻折点重合 / 折点与锚点重合均拒绝（端点衔接）", () => {
+    const d = enabled({
+      replacementNodes: [
+        { x: "5", y: "5" },
+        { x: "5", y: "5" },
+      ],
+    });
+    expect(validateDraft(d)["reroute.replacement_nodes[1].x"]).toContain("重合");
+    // 首折点与起始锚点 (0,0) 重合
+    const d2 = enabled({ replacementNodes: [{ x: "0", y: "0" }] });
+    expect(validateDraft(d2)["reroute.replacement_nodes[0].x"]).toContain("起始锚点");
+    // 末折点与结束锚点 (100,0) 重合
+    const d3 = enabled({
+      replacementNodes: [
+        { x: "50", y: "40" },
+        { x: "100", y: "0" },
+      ],
+    });
+    expect(validateDraft(d3)["reroute.replacement_nodes[1].x"]).toContain("结束锚点");
   });
 });

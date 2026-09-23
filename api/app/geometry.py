@@ -37,6 +37,26 @@ Point = Tuple[float, float]
 
 
 @dataclass(frozen=True)
+class AnalysisResult:
+    """一次完整几何分析的全部未舍入产物（碰撞/区间/复合段/精确片段/累计里程）。
+
+    改线预览需要对原线与候选线各跑一次同一套规则并在**舍入前**比对精确片段，
+    故累计里程表与 :class:`SegmentPiece` 列表同样对外暴露。
+    """
+
+    collisions: Tuple["Collision", ...]
+    intervals: Tuple["IntrusionInterval", ...]
+    compounds: Tuple["CompoundIntrusionSegment", ...]
+    pieces: Tuple["SegmentPiece", ...]
+    cum: Tuple[float, ...]
+
+    @property
+    def total_length(self) -> float:
+        """路径累计总里程（未舍入双精度）。"""
+        return self.cum[-1] if self.cum else 0.0
+
+
+@dataclass(frozen=True)
 class Collision:
     segment_index: int
     circle_index: int
@@ -626,17 +646,15 @@ def _build_compound_segments(
     return runs
 
 
-def analyze_path_full(
+def analyze_path_result(
     nodes: Sequence[Point],
     circles: Sequence[Tuple[Point, float]],
     cable_radius: float,
-) -> Tuple[List[Collision], List[IntrusionInterval], List[CompoundIntrusionSegment]]:
-    """一次计算全部碰撞、连续侵入区间与复合侵入段。
+) -> AnalysisResult:
+    """与 :func:`analyze_path_full` 同一条计算链路，返回未舍入的完整结果。
 
-    排序：碰撞按 (线段下标, 禁入圈输入顺序)；侵入区间按
-    (起始累计里程, 禁入圈输入顺序)；复合侵入段按
-    (未舍入起始里程, circle_indices 字典序)。碰撞集合与区间段片一一
-    对应：每个「线段 × 禁入圈」闭交集非空恰好对应一处碰撞。
+    原线与候选改线**必须**各自经过本函数，保证标定、粗筛、精确求交、
+    跨拐点合并与复合段扫描用的是同一套规则与同一批次结果。
     """
     n = len(nodes) - 1
 
@@ -690,7 +708,29 @@ def analyze_path_full(
     intervals = _build_intervals(pieces)
     # 复合侵入段直接在舍入前的精确片段闭区间上扫描（不经跨拐点合并）。
     compounds = _build_compound_segments(pieces, nodes, cum)
-    return collisions, intervals, compounds
+    return AnalysisResult(
+        collisions=tuple(collisions),
+        intervals=tuple(intervals),
+        compounds=tuple(compounds),
+        pieces=tuple(pieces),
+        cum=tuple(cum),
+    )
+
+
+def analyze_path_full(
+    nodes: Sequence[Point],
+    circles: Sequence[Tuple[Point, float]],
+    cable_radius: float,
+) -> Tuple[List[Collision], List[IntrusionInterval], List[CompoundIntrusionSegment]]:
+    """一次计算全部碰撞、连续侵入区间与复合侵入段。
+
+    排序：碰撞按 (线段下标, 禁入圈输入顺序)；侵入区间按
+    (起始累计里程, 禁入圈输入顺序)；复合侵入段按
+    (未舍入起始里程, circle_indices 字典序)。碰撞集合与区间段片一一
+    对应：每个「线段 × 禁入圈」闭交集非空恰好对应一处碰撞。
+    """
+    result = analyze_path_result(nodes, circles, cable_radius)
+    return list(result.collisions), list(result.intervals), list(result.compounds)
 
 
 def analyze_path(

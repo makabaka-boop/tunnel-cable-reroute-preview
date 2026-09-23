@@ -17,6 +17,13 @@ export interface CalibrationPairDraft {
   pathX: string;
   pathY: string;
 }
+/** 一次性改线预览草稿：替换 [start,end] 节点区间，接入若干内部折点。 */
+export interface RerouteDraft {
+  enabled: boolean;
+  startNodeIndex: string;
+  endNodeIndex: string;
+  replacementNodes: NodeDraft[];
+}
 export interface FormDraft {
   cableRadius: string;
   nodes: NodeDraft[];
@@ -24,6 +31,7 @@ export interface FormDraft {
   calibrationEnabled: boolean;
   maxRmsError: string;
   calibrationPairs: CalibrationPairDraft[];
+  reroute: RerouteDraft;
 }
 
 function parseFiniteInt(raw: string): number {
@@ -156,6 +164,103 @@ export function validateDraft(draft: FormDraft): FieldErrors {
     }
   }
 
+  // 可选一次性改线预览：字段键与后端一致（reroute.*）；未启用时不校验不上送。
+  if (draft.reroute.enabled) {
+    const r = draft.reroute;
+    let start: number | null = null;
+    let end: number | null = null;
+    const parseIndex = (raw: string, key: string, label: string) => {
+      const t = raw.trim();
+      if (!/^[+-]?\d+$/.test(t)) {
+        errors[key] = `${label}必须是非负整数下标`;
+        return null;
+      }
+      const n = Number(t);
+      if (!Number.isSafeInteger(n) || n < 0) {
+        errors[key] = `${label}必须是非负整数下标`;
+        return null;
+      }
+      return n;
+    };
+    start = parseIndex(r.startNodeIndex, "reroute.start_node_index", "起始节点下标");
+    end = parseIndex(r.endNodeIndex, "reroute.end_node_index", "结束节点下标");
+
+    if (r.replacementNodes.length === 0) {
+      errors["reroute.replacement_nodes"] = "替代折点至少需要一个";
+    }
+    r.replacementNodes.forEach((p, i) => {
+      try {
+        parseFiniteInt(p.x);
+      } catch (e) {
+        errors[`reroute.replacement_nodes[${i}].x`] = `折点 X ${(e as Error).message}`;
+      }
+      try {
+        parseFiniteInt(p.y);
+      } catch (e) {
+        errors[`reroute.replacement_nodes[${i}].y`] = `折点 Y ${(e as Error).message}`;
+      }
+    });
+    // 相邻折点重合
+    for (let i = 0; i < r.replacementNodes.length - 1; i++) {
+      const a = r.replacementNodes[i];
+      const b = r.replacementNodes[i + 1];
+      if (
+        a.x.trim() !== "" && a.y.trim() !== "" &&
+        b.x.trim() !== "" && b.y.trim() !== "" &&
+        a.x.trim() === b.x.trim() && a.y.trim() === b.y.trim()
+      ) {
+        errors[`reroute.replacement_nodes[${i + 1}].x`] =
+          "替代折点相邻重合，禁止相邻重复节点";
+      }
+    }
+
+    if (start !== null && start >= draft.nodes.length) {
+      errors["reroute.start_node_index"] =
+        `起始节点下标超出节点范围（共 ${draft.nodes.length} 个节点）`;
+      start = null;
+    }
+    if (end !== null && end >= draft.nodes.length) {
+      errors["reroute.end_node_index"] =
+        `结束节点下标超出节点范围（共 ${draft.nodes.length} 个节点）`;
+      end = null;
+    }
+    if (start !== null && end !== null && end <= start) {
+      errors["reroute.end_node_index"] =
+        "结束节点下标必须严格大于起始节点下标（至少替换一条连续线段）";
+    }
+    // 端点衔接：首折点不得与起始锚点重合、末折点不得与结束锚点重合。
+    if (
+      start !== null &&
+      r.replacementNodes.length > 0 &&
+      draft.nodes[start]
+    ) {
+      const first = r.replacementNodes[0];
+      const anchor = draft.nodes[start];
+      if (
+        first.x.trim() !== "" && first.y.trim() !== "" &&
+        first.x.trim() === anchor.x.trim() && first.y.trim() === anchor.y.trim()
+      ) {
+        errors["reroute.replacement_nodes[0].x"] =
+          "首个替代折点与起始锚点重合，接入段为零长";
+      }
+    }
+    if (
+      end !== null &&
+      r.replacementNodes.length > 0 &&
+      draft.nodes[end]
+    ) {
+      const last = r.replacementNodes[r.replacementNodes.length - 1];
+      const anchor = draft.nodes[end];
+      if (
+        last.x.trim() !== "" && last.y.trim() !== "" &&
+        last.x.trim() === anchor.x.trim() && last.y.trim() === anchor.y.trim()
+      ) {
+        errors[`reroute.replacement_nodes[${r.replacementNodes.length - 1}].x`] =
+          "末个替代折点与结束锚点重合，接入段为零长";
+      }
+    }
+  }
+
   return errors;
 }
 
@@ -185,6 +290,17 @@ export function buildPayload(draft: FormDraft): PrecheckPayload {
         y: parseFiniteNumber(p.pathY),
       })),
       max_rms_error: parsePositiveFinite(draft.maxRmsError),
+    };
+  }
+  // 未启用改线预览时完全省略 reroute 键，旧接口与交互保持原样。
+  if (draft.reroute.enabled) {
+    payload.reroute = {
+      start_node_index: Number(draft.reroute.startNodeIndex.trim()),
+      end_node_index: Number(draft.reroute.endNodeIndex.trim()),
+      replacement_nodes: draft.reroute.replacementNodes.map((p) => ({
+        x: parseFiniteInt(p.x),
+        y: parseFiniteInt(p.y),
+      })),
     };
   }
   return payload;

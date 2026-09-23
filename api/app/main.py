@@ -1,8 +1,8 @@
-"""FastAPI 应用：隧道电缆绕孔预检（可选全站仪 → 施工坐标现场标定）。"""
+"""FastAPI 应用：隧道电缆绕孔预检（可选全站仪 → 施工坐标现场标定、一次性改线预览）。"""
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -10,10 +10,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .calibration import fit_rigid_transform
-from .geometry import Collision, CompoundIntrusionSegment, IntrusionInterval, analyze_path_full
+from .geometry import AnalysisResult, analyze_path_result
+from .reroute import (
+    RerouteSpec,
+    build_preview,
+    check_junctions,
+    validate_reroute,
+)
 from .schemas import (
     CalibrationOut,
     CircleOut,
+    CircleRisksOut,
     CollisionOut,
     CompoundIntrusionSegmentOut,
     CompoundPieceOut,
@@ -22,9 +29,13 @@ from .schemas import (
     PointOut,
     PrecheckRequest,
     PrecheckResponse,
+    RerouteEventOut,
+    ReroutePreviewOut,
+    RerouteRemainingOut,
+    RerouteSummaryOut,
 )
 
-app = FastAPI(title="隧道电缆绕孔预检器", version="1.0.0")
+app = FastAPI(title="隧道电缆绕孔预检器", version="1.1.0")
 
 # 前端通过 Vite dev server / 浏览器直连时需要 CORS；
 # 容器内 nginx 同源代理 /api 也不受影响。
@@ -45,14 +56,23 @@ def _loc_to_field(loc: tuple) -> str:
     """把 Pydantic 的错误定位转成前端可索引的字段键。
 
     例：('body', 'nodes', 0, 'x') -> 'nodes[0].x'
+
+    嵌套模型校验器产生的定位可能是「已带点号的合并段」（如手动构造的
+    'reroute.end_node_index'），先按点拆开，避免拼接出错误键名。
     """
-    parts = [p for p in loc if p != "body"]
+    parts: List[object] = []
+    for raw in (p for p in loc if p != "body"):
+        if isinstance(raw, str) and "." in raw:
+            for sub in raw.split("."):
+                parts.append(sub)
+        else:
+            parts.append(raw)
     key = ""
     for p in parts:
         if isinstance(p, int):
             key += f"[{p}]"
         else:
-            key = f"{key}.{p}" if key else str(p)
+            key = str(p) if key == "" else f"{key}.{p}"
     return key or "_root"
 
 
@@ -92,6 +112,111 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 @app.get("/api/health")
 def health() -> Dict[str, str]:
     return {"status": "ok"}
+
+
+def _rpt(p) -> PointOut:
+    return PointOut(x=round3(p[0]), y=round3(p[1]))
+
+
+def _build_response(
+    result: AnalysisResult,
+    nodes: List[Tuple[float, float]],
+    circles: List[Tuple[Tuple[float, float], float]],
+    cable_radius: float,
+    calibration_view: Optional[CalibrationOut],
+) -> PrecheckResponse:
+    """把一次未舍入分析结果组装为展示响应（三位小数仅发生在这里）。
+
+    原线与候选改线共用本函数，确保两套结论来自完全相同的标定与几何规则、
+    相同的排序与舍入口径。
+    """
+    collisions = [
+        CollisionOut(
+            segment_index=c.segment_index,
+            circle_index=c.circle_index,
+            nearest=_rpt(c.nearest),
+            distance=round3(c.distance),
+            expanded_radius=round3(c.expanded_radius),
+            circle_center=_rpt(circles[c.circle_index][0]),
+            circle_radius=round3(circles[c.circle_index][1]),
+            cable_radius=round3(cable_radius),
+        )
+        for c in result.collisions
+    ]
+
+    interval_views = [
+        IntrusionIntervalOut(
+            circle_index=iv.circle_index,
+            entry_segment_index=iv.entry_segment_index,
+            exit_segment_index=iv.exit_segment_index,
+            entry=_rpt(iv.entry_point),
+            exit=_rpt(iv.exit_point),
+            start_mileage=round3(iv.start_mileage),
+            end_mileage=round3(iv.end_mileage),
+            length=round3(iv.length),
+            pieces=[
+                IntervalPieceOut(
+                    segment_index=p.segment_index,
+                    circle_index=p.circle_index,
+                    entry=_rpt(p.entry_point),
+                    exit=_rpt(p.exit_point),
+                    start_mileage=round3(p.start_mileage),
+                    end_mileage=round3(p.end_mileage),
+                    length=round3(p.length),
+                )
+                for p in iv.pieces
+            ],
+        )
+        for iv in result.intervals
+    ]
+
+    circle_views = [
+        CircleOut(
+            center=PointOut(x=round3(center[0]), y=round3(center[1])),
+            radius=round3(r),
+            expanded_radius=round3(r + cable_radius),
+        )
+        for (center, r) in circles
+    ]
+
+    compound_views = [
+        CompoundIntrusionSegmentOut(
+            circle_indices=list(seg.circle_indices),
+            start_mileage=round3(seg.start_mileage),
+            end_mileage=round3(seg.end_mileage),
+            start=_rpt(seg.start_point),
+            end=_rpt(seg.end_point),
+            start_inclusive=seg.start_inclusive,
+            end_inclusive=seg.end_inclusive,
+            length=round3(seg.length),
+            pieces=[
+                CompoundPieceOut(
+                    segment_index=p.segment_index,
+                    circle_indices=list(p.circle_indices),
+                    entry=_rpt(p.entry_point),
+                    exit=_rpt(p.exit_point),
+                    start_mileage=round3(p.start_mileage),
+                    end_mileage=round3(p.end_mileage),
+                    length=round3(p.length),
+                )
+                for p in seg.pieces
+            ],
+        )
+        for seg in result.compounds
+    ]
+
+    return PrecheckResponse(
+        feasible=len(collisions) == 0,
+        cable_radius=round3(cable_radius),
+        nodes=[PointOut(x=round3(x), y=round3(y)) for (x, y) in nodes],
+        circles=circle_views,
+        collision_count=len(collisions),
+        first_collision=collisions[0] if collisions else None,
+        collisions=collisions,
+        intrusion_intervals=interval_views,
+        compound_intrusion_segments=compound_views,
+        calibration=calibration_view,
+    )
 
 
 @app.post("/api/precheck", response_model=PrecheckResponse)
@@ -137,102 +262,156 @@ def precheck(payload: PrecheckRequest) -> PrecheckResponse:
             rms_error=round3(transform.rms_error),
         )
 
-    raw: List[Collision]
-    intervals: List[IntrusionInterval]
-    compounds: List[CompoundIntrusionSegment]
-    raw, intervals, compounds = analyze_path_full(
+    # 改线规格的结构校验在 schemas 层已完成；这里只剩几何夹具复核
+    # （端点衔接/相邻重合），正常路径下不会失败，失败同样以字段级 422 返回。
+    reroute_spec: Optional[RerouteSpec] = None
+    if payload.reroute is not None:
+        spec, err = validate_reroute(
+            node_count=len(nodes),
+            start=payload.reroute.start_node_index,
+            end=payload.reroute.end_node_index,
+            replacement_nodes=[(p.x, p.y) for p in payload.reroute.replacement_nodes],
+        )
+        if err is not None:
+            field, message = err
+            raise RequestValidationError(
+                errors=[{
+                    "loc": ("body", "reroute", field),
+                    "msg": f"Value error, {message}",
+                    "type": "value_error",
+                }]
+            )
+        assert spec is not None
+        junction_err = check_junctions(nodes, spec)
+        if junction_err is not None:
+            field, message = junction_err
+            # field 形如 "replacement_nodes[0]" → 定位到具体列表项
+            loc_parts: List[Any] = ["body", "reroute"]
+            if "[" in field:
+                name, idx_part = field.split("[", 1)
+                loc_parts.append(name)
+                loc_parts.append(int(idx_part.rstrip("]")))
+            else:
+                loc_parts.append(field)
+            raise RequestValidationError(
+                errors=[{
+                    "loc": tuple(loc_parts),
+                    "msg": f"Value error, {message}",
+                    "type": "value_error",
+                }]
+            )
+        reroute_spec = spec
+
+    original = analyze_path_result(
         nodes=nodes,
         circles=circles,
         cable_radius=payload.cable_radius,
     )
-
-    def rpt(p) -> PointOut:
-        return PointOut(x=round3(p[0]), y=round3(p[1]))
-
-    collisions = [
-        CollisionOut(
-            segment_index=c.segment_index,
-            circle_index=c.circle_index,
-            nearest=rpt(c.nearest),
-            distance=round3(c.distance),
-            expanded_radius=round3(c.expanded_radius),
-            circle_center=rpt(circles[c.circle_index][0]),
-            circle_radius=round3(circles[c.circle_index][1]),
-            cable_radius=round3(payload.cable_radius),
-        )
-        for c in raw
-    ]
-
-    interval_views = [
-        IntrusionIntervalOut(
-            circle_index=iv.circle_index,
-            entry_segment_index=iv.entry_segment_index,
-            exit_segment_index=iv.exit_segment_index,
-            entry=rpt(iv.entry_point),
-            exit=rpt(iv.exit_point),
-            start_mileage=round3(iv.start_mileage),
-            end_mileage=round3(iv.end_mileage),
-            length=round3(iv.length),
-            pieces=[
-                IntervalPieceOut(
-                    segment_index=p.segment_index,
-                    circle_index=p.circle_index,
-                    entry=rpt(p.entry_point),
-                    exit=rpt(p.exit_point),
-                    start_mileage=round3(p.start_mileage),
-                    end_mileage=round3(p.end_mileage),
-                    length=round3(p.length),
-                )
-                for p in iv.pieces
-            ],
-        )
-        for iv in intervals
-    ]
-
-    circle_views = [
-        CircleOut(
-            center=PointOut(x=round3(center[0]), y=round3(center[1])),
-            radius=round3(r),
-            expanded_radius=round3(r + payload.cable_radius),
-        )
-        for (center, r) in circles
-    ]
-
-    compound_views = [
-        CompoundIntrusionSegmentOut(
-            circle_indices=list(seg.circle_indices),
-            start_mileage=round3(seg.start_mileage),
-            end_mileage=round3(seg.end_mileage),
-            start=rpt(seg.start_point),
-            end=rpt(seg.end_point),
-            start_inclusive=seg.start_inclusive,
-            end_inclusive=seg.end_inclusive,
-            length=round3(seg.length),
-            pieces=[
-                CompoundPieceOut(
-                    segment_index=p.segment_index,
-                    circle_indices=list(p.circle_indices),
-                    entry=rpt(p.entry_point),
-                    exit=rpt(p.exit_point),
-                    start_mileage=round3(p.start_mileage),
-                    end_mileage=round3(p.end_mileage),
-                    length=round3(p.length),
-                )
-                for p in seg.pieces
-            ],
-        )
-        for seg in compounds
-    ]
-
-    return PrecheckResponse(
-        feasible=len(collisions) == 0,
-        cable_radius=round3(payload.cable_radius),
-        nodes=[PointOut(x=round3(x), y=round3(y)) for (x, y) in nodes],
-        circles=circle_views,
-        collision_count=len(collisions),
-        first_collision=collisions[0] if collisions else None,
-        collisions=collisions,
-        intrusion_intervals=interval_views,
-        compound_intrusion_segments=compound_views,
-        calibration=calibration_view,
+    response = _build_response(
+        result=original,
+        nodes=nodes,
+        circles=circles,
+        cable_radius=payload.cable_radius,
+        calibration_view=calibration_view,
     )
+
+    if reroute_spec is not None:
+        preview = build_preview(
+            nodes=nodes,
+            circles=circles,
+            cable_radius=payload.cable_radius,
+            spec=reroute_spec,
+        )
+        # 候选线响应：同一套标定视图、同一批变换后禁入圈、同一舍入口径。
+        candidate_view = _build_response(
+            result=preview.candidate,
+            nodes=list(preview.candidate_nodes),
+            circles=circles,
+            cable_radius=payload.cable_radius,
+            calibration_view=calibration_view,
+        )
+
+        def _event_out(ev) -> RerouteEventOut:
+            return RerouteEventOut(
+                circle_index=ev.circle_index,
+                segment_index=ev.segment_index,
+                entry=_rpt(ev.entry_point),
+                exit=_rpt(ev.exit_point),
+                start_mileage=round3(ev.start_mileage),
+                end_mileage=round3(ev.end_mileage),
+                length=round3(ev.length),
+            )
+
+        risk_views = [
+            CircleRisksOut(
+                circle_index=cr.circle_index,
+                status=cr.status,
+                removed=[_event_out(ev) for ev in cr.removed],
+                added=[_event_out(ev) for ev in cr.added],
+                remaining=[
+                    RerouteRemainingOut(
+                        circle_index=rp.circle_index,
+                        original_segment_index=rp.original_segment_index,
+                        candidate_segment_index=rp.candidate_segment_index,
+                        entry=_rpt(rp.entry_point),
+                        exit=_rpt(rp.exit_point),
+                        original_start_mileage=round3(rp.original_start_mileage),
+                        original_end_mileage=round3(rp.original_end_mileage),
+                        candidate_start_mileage=round3(rp.candidate_start_mileage),
+                        candidate_end_mileage=round3(rp.candidate_end_mileage),
+                        length=round3(rp.length),
+                        mileage_shift=round3(rp.mileage_shift),
+                    )
+                    for rp in cr.remaining
+                ],
+            )
+            for cr in preview.circle_risks
+        ]
+
+        status_counts = {
+            "removed": 0, "added": 0, "remaining": 0,
+            "reduced": 0, "increased": 0, "replaced": 0,
+        }
+        n_removed = n_added = n_remaining = 0
+        for cr in preview.circle_risks:
+            status_counts[cr.status] += 1
+            n_removed += len(cr.removed)
+            n_added += len(cr.added)
+            n_remaining += len(cr.remaining)
+
+        summary = RerouteSummaryOut(
+            circle_count=len(preview.circle_risks),
+            removed_event_count=n_removed,
+            added_event_count=n_added,
+            remaining_event_count=n_remaining,
+            circles_removed=status_counts["removed"],
+            circles_added=status_counts["added"],
+            circles_remaining=status_counts["remaining"],
+            circles_reduced=status_counts["reduced"],
+            circles_increased=status_counts["increased"],
+            circles_replaced=status_counts["replaced"],
+            original_total_length=round3(original.total_length),
+            candidate_total_length=round3(preview.candidate.total_length),
+            mileage_shift=round3(preview.mileage_shift),
+        )
+
+        response.reroute_preview = ReroutePreviewOut(
+            start_node_index=reroute_spec.start,
+            end_node_index=reroute_spec.end,
+            replacement_nodes=[_rpt(p) for p in reroute_spec.replacement_nodes],
+            junction_start=_rpt(preview.junction_start),
+            junction_end=_rpt(preview.junction_end),
+            prefix_length=round3(preview.prefix_length),
+            original_junction_end_mileage=round3(
+                preview.original_junction_end_mileage
+            ),
+            candidate_junction_end_mileage=round3(
+                preview.candidate_junction_end_mileage
+            ),
+            mileage_shift=round3(preview.mileage_shift),
+            candidate=candidate_view,
+            circle_risks=risk_views,
+            summary=summary,
+        )
+
+    return response

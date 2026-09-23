@@ -528,3 +528,88 @@ h2 {
   width: 12px;
   height: 12px;
 }
+
+/* ---------- 一次性改线预览 ---------- */
+.reroute-indices {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0;
+}
+
+.reroute-actions {
+  margin-top: 10px;
+}
+
+.reroute-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  border: 1px solid rgba(125, 211, 252, 0.45);
+  border-radius: 10px;
+  background: rgba(14, 116, 144, 0.08);
+}
+
+.view-toggle {
+  display: inline-flex;
+  gap: 6px;
+}
+
+.toggle-btn {
+  font-weight: 600;
+}
+
+.toggle-btn.active {
+  background: #075985;
+  color: #fff;
+  border-color: #075985;
+}
+
+.reroute-diff-panel {
+  border-left: 4px solid #38bdf8;
+}
+
+.reroute-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  padding: 8px 0 12px;
+  font-weight: 600;
+}
+
+.circle-risk {
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  border-radius: 8px;
+}
+
+.risk-event-list {
+  margin: 6px 0 0;
+  padding-left: 4px;
+  list-style: none;
+}
+
+.risk-event {
+  font-size: 13px;
+  line-height: 1.6;
+  padding: 2px 0;
+}
+
+.risk-removed { color: #15803d; }
+.risk-added { color: #b91c1c; }
+.risk-remaining { color: #92400e; }
+
+.risk-status-removed { background: #dcfce7; color: #166534; }
+.risk-status-added { background: #fee2e2; color: #991b1b; }
+.risk-status-remaining { background: #fef3c7; color: #92400e; }
+.risk-status-reduced { background: #d1fae5; color: #065f46; }
+.risk-status-increased { background: #ffedd5; color: #9a3412; }
+.risk-status-replaced { background: #ede9fe; color: #5b21b6; }
+
+.reroute-mileage-note {
+  margin-top: 8px;
+}

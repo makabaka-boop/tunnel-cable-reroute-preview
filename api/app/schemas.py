@@ -165,6 +165,49 @@ class CalibrationIn(BaseModel):
         return points
 
 
+class RerouteIn(BaseModel):
+    """一次性改线预览规格：替换连续节点区间 [start, end]（两端锚点保留），
+    在两锚点之间接入 ``replacement_nodes`` 个内部折点（至少 1 个）。
+
+    - ``start_node_index``/``end_node_index`` 为非负整数下标，
+      必须 ``0 ≤ start < end ≤ 末节点下标``（至少替换一条连续线段）；
+    - 替代折点为整数毫米坐标，至少 1 个；首/末折点不得与各自锚点重合
+      （零长接入段），相邻折点不得重合（折线有效性同原规则，允许自交）；
+    - 端点衔接在拿到完整 nodes 后由请求级校验复核。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    start_node_index: Annotated[int, Field(strict=True, ge=0)]
+    end_node_index: Annotated[int, Field(strict=True, ge=0)]
+    replacement_nodes: Annotated[
+        List[StrictPointIn], Field(min_length=1)
+    ]
+
+    @field_validator("replacement_nodes")
+    @classmethod
+    def _replacement_no_adjacent_duplicates(
+        cls, points: List[StrictPointIn]
+    ):
+        for i in range(len(points) - 1):
+            a, b = points[i], points[i + 1]
+            if a.x == b.x and a.y == b.y:
+                raise ValueError(
+                    f"替代折点 #{i} 与 #{i + 1} 完全重合，禁止相邻重复节点"
+                )
+        return points
+
+    @field_validator("end_node_index")
+    @classmethod
+    def _end_after_start(cls, v: int, info):
+        start = info.data.get("start_node_index")
+        if start is not None and v <= start:
+            raise ValueError(
+                "结束节点下标必须严格大于起始节点下标（至少替换一条连续线段）"
+            )
+        return v
+
+
 class PrecheckRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -173,6 +216,8 @@ class PrecheckRequest(BaseModel):
     circles: List[StrictCircleIn]
     # 可选现场标定；省略时行为与旧版完全一致。
     calibration: Optional[CalibrationIn] = None
+    # 可选一次性改线预览；省略时请求/响应与旧版逐项兼容。
+    reroute: Optional[RerouteIn] = None
 
     @field_validator("nodes")
     @classmethod
@@ -186,6 +231,37 @@ class PrecheckRequest(BaseModel):
                     f"相邻节点 #{i} 与 #{i + 1} 完全重合，禁止相邻重复节点"
                 )
         return nodes
+
+    @field_validator("reroute")
+    @classmethod
+    def _validate_reroute_against_nodes(
+        cls, reroute: Optional["RerouteIn"], info
+    ):
+        """拿到完整 nodes 后复核改线下标范围与端点衔接。"""
+        if reroute is None:
+            return None
+        nodes = info.data.get("nodes")
+        # nodes 自身非法时其字段错误已单独产生；这里跳过跨字段复核。
+        if nodes is None:
+            return reroute
+        node_count = len(nodes)
+        if reroute.start_node_index >= node_count:
+            raise ValueError(
+                f"起始节点下标超出节点范围（共 {node_count} 个节点）"
+            )
+        if reroute.end_node_index >= node_count:
+            raise ValueError(
+                f"结束节点下标超出节点范围（共 {node_count} 个节点）"
+            )
+        anchor_a = nodes[reroute.start_node_index]
+        anchor_b = nodes[reroute.end_node_index]
+        first = reroute.replacement_nodes[0]
+        last = reroute.replacement_nodes[-1]
+        if first.x == anchor_a.x and first.y == anchor_a.y:
+            raise ValueError("首个替代折点与起始锚点重合，接入段为零长")
+        if last.x == anchor_b.x and last.y == anchor_b.y:
+            raise ValueError("末个替代折点与结束锚点重合，接入段为零长")
+        return reroute
 
 
 class PointOut(BaseModel):
@@ -271,6 +347,83 @@ class CalibrationOut(BaseModel):
     rms_error: float             # 控制点残差均方根（毫米）
 
 
+class RerouteEventOut(BaseModel):
+    """消除/新增事件（候选/原线各自视角的精确片段，展示三位小数）。"""
+
+    circle_index: int
+    segment_index: int       # 该视角（原线或候选线）自身的线段下标
+    entry: PointOut
+    exit: PointOut
+    start_mileage: float
+    end_mileage: float
+    length: float
+
+
+class RerouteRemainingOut(BaseModel):
+    """仍存在事件：同一未舍入结构身份，给出原线/候选线双份里程。"""
+
+    circle_index: int
+    original_segment_index: int
+    candidate_segment_index: int
+    entry: PointOut
+    exit: PointOut
+    original_start_mileage: float
+    original_end_mileage: float
+    candidate_start_mileage: float
+    candidate_end_mileage: float
+    length: float
+    mileage_shift: float     # 候选里程 - 原线里程（前缀为 0，后缀为固定平移）
+
+
+class CircleRisksOut(BaseModel):
+    """单个禁入圈的「消除/新增/仍存在」归类。
+
+    status ∈ remaining/removed/added/reduced/increased/replaced：
+    仅仍存在 / 仅消除 / 仅新增 / 消除+仍存在 / 新增+仍存在 / 消除+新增。
+    """
+
+    circle_index: int
+    status: str
+    removed: List[RerouteEventOut]
+    added: List[RerouteEventOut]
+    remaining: List[RerouteRemainingOut]
+
+
+class RerouteSummaryOut(BaseModel):
+    """按事件与按圈两种口径的统计（计数为整数，长度为三位小数展示值）。"""
+
+    circle_count: int
+    removed_event_count: int
+    added_event_count: int
+    remaining_event_count: int
+    circles_removed: int          # 仅消除
+    circles_added: int            # 仅新增
+    circles_remaining: int        # 仅仍存在
+    circles_reduced: int          # 消除 + 仍存在
+    circles_increased: int        # 新增 + 仍存在
+    circles_replaced: int         # 消除 + 新增
+    original_total_length: float
+    candidate_total_length: float
+    mileage_shift: float          # 候选后缀里程平移（= 新接入路径长 - 旧段长）
+
+
+class ReroutePreviewOut(BaseModel):
+    """一次性改线预览：端点衔接信息、候选线全套结论与按圈风险摘要。"""
+
+    start_node_index: int
+    end_node_index: int
+    replacement_nodes: List[PointOut]
+    junction_start: PointOut
+    junction_end: PointOut
+    prefix_length: float              # 未改动前缀里程（原线逐位沿用）
+    original_junction_end_mileage: float
+    candidate_junction_end_mileage: float
+    mileage_shift: float
+    candidate: "PrecheckResponse"     # 候选线用同一套规则算出的全套结论
+    circle_risks: List[CircleRisksOut]
+    summary: RerouteSummaryOut
+
+
 class PrecheckResponse(BaseModel):
     feasible: bool
     cable_radius: float      # 展示用（三位小数）
@@ -285,3 +438,9 @@ class PrecheckResponse(BaseModel):
     )
     # 请求带 calibration 时给出标定摘要；省略时为 null（旧字段逐项兼容）。
     calibration: Optional[CalibrationOut] = None
+    # 请求带 reroute 时给出改线预览（原线结论仍在顶层字段）；省略时为 null。
+    reroute_preview: Optional[ReroutePreviewOut] = None
+
+
+# ReroutePreviewOut.candidate 前向引用了本模型。
+ReroutePreviewOut.model_rebuild()
